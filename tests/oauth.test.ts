@@ -144,11 +144,12 @@ async function jsonBody(res: Response): Promise<Record<string, unknown>> {
   return (await res.json()) as Record<string, unknown>;
 }
 
-function cookieValue(res: Response): string | null {
+// The binding cookie is per-flow: `[__Host-]wmcp_oauth_bt_<internalState>=<value>`.
+function bindingCookie(res: Response): { name: string; value: string } | null {
   const setCookie = res.headers.get("set-cookie");
   if (!setCookie) return null;
-  const m = setCookie.match(/wmcp_oauth_bt=([^;]+)/);
-  return m ? m[1] : null;
+  const m = setCookie.match(/((?:__Host-)?wmcp_oauth_bt_[^=]+)=([^;]+)/);
+  return m ? { name: m[1], value: m[2] } : null;
 }
 
 function stateFromRedirect(res: Response): string {
@@ -158,14 +159,16 @@ function stateFromRedirect(res: Response): string {
 }
 
 /** Run /authorize and return the internal state + browser cookie it issues. */
-async function startFlow(): Promise<{ internalState: string; cookie: string }> {
-  const res = await oauth.request(authorizeUrl());
+async function startFlow(
+  init?: RequestInit
+): Promise<{ internalState: string; cookie: { name: string; value: string } }> {
+  const res = await oauth.request(authorizeUrl(), init);
   expect(res.status).toBe(302);
   const internalState = stateFromRedirect(res);
-  const cookie = cookieValue(res);
+  const cookie = bindingCookie(res);
   expect(internalState).toBeTruthy();
   expect(cookie).toBeTruthy();
-  return { internalState, cookie: cookie as string };
+  return { internalState, cookie: cookie as { name: string; value: string } };
 }
 
 describe("OAuth /authorize", () => {
@@ -176,13 +179,31 @@ describe("OAuth /authorize", () => {
       "https://account.withings.com/oauth2_user/authorize2"
     );
     const setCookie = res.headers.get("set-cookie") ?? "";
-    expect(setCookie).toContain("wmcp_oauth_bt=");
+    expect(setCookie).toContain("wmcp_oauth_bt_");
     expect(setCookie).toContain("HttpOnly");
     expect(setCookie.toLowerCase()).toContain("samesite=lax");
     // The stored session carries only the HASH of the cookie value.
     const stored = [...sessions.values()][0];
     expect(stored.browser_token_hash).toBeTruthy();
-    expect(stored.browser_token_hash).not.toBe(cookieValue(res));
+    expect(stored.browser_token_hash).not.toBe(bindingCookie(res)?.value);
+  });
+
+  test("names the cookie per-flow and sets __Host- + Secure over HTTPS", async () => {
+    const res = await oauth.request(authorizeUrl(), {
+      headers: { host: "withings-mcp.example", "x-forwarded-proto": "https" },
+    });
+    const setCookie = res.headers.get("set-cookie") ?? "";
+    const internalState = stateFromRedirect(res);
+    // __Host- prefix (blocks sibling-subdomain fixation) + Secure over HTTPS.
+    expect(setCookie).toContain(`__Host-wmcp_oauth_bt_${internalState}=`);
+    expect(setCookie).toContain("Secure");
+  });
+
+  test("two concurrent flows get distinct cookie names (no clobbering)", async () => {
+    const a = await startFlow();
+    const b = await startFlow();
+    expect(a.internalState).not.toBe(b.internalState);
+    expect(a.cookie.name).not.toBe(b.cookie.name);
   });
 
   test("rejects a request with no PKCE code_challenge", async () => {
@@ -202,7 +223,7 @@ describe("OAuth /callback browser binding", () => {
     const { internalState, cookie } = await startFlow();
 
     const res = await oauth.request(`/callback?code=withings-code&state=${internalState}`, {
-      headers: { Cookie: `wmcp_oauth_bt=${cookie}` },
+      headers: { Cookie: `${cookie.name}=${cookie.value}` },
     });
 
     expect(res.status).toBe(302);
@@ -210,7 +231,7 @@ describe("OAuth /callback browser binding", () => {
     expect(loc.origin + loc.pathname).toBe(CLIENT_REDIRECT);
     expect(loc.searchParams.get("code")).toBeTruthy();
     expect(loc.searchParams.get("state")).toBe("client-state-123");
-    // An auth code was issued and the session consumed.
+    // An auth code was issued and the session consumed on success.
     expect(authCodes.size).toBe(1);
     expect(sessions.has(internalState)).toBe(false);
   });
@@ -225,25 +246,62 @@ describe("OAuth /callback browser binding", () => {
 
     expect(res.status).toBe(400);
     expect((await jsonBody(res)).error).toBe("invalid_state");
-    // No auth code minted, and the session was consumed so it cannot be retried.
+    // No auth code minted. The session is left to expire (10-min TTL) rather than
+    // consumed, so a sibling flow's stray callback cannot cancel a live login.
     expect(authCodes.size).toBe(0);
-    expect(sessions.has(internalState)).toBe(false);
   });
 
-  test("rejects a callback whose cookie does not match the flow", async () => {
-    const { internalState } = await startFlow();
+  test("rejects a callback whose cookie value does not match the flow", async () => {
+    const { internalState, cookie } = await startFlow();
 
     const res = await oauth.request(`/callback?code=x&state=${internalState}`, {
-      headers: { Cookie: "wmcp_oauth_bt=some-other-browsers-token" },
+      headers: { Cookie: `${cookie.name}=some-other-browsers-token` },
     });
 
     expect(res.status).toBe(400);
     expect(authCodes.size).toBe(0);
   });
 
+  test("rejects a legacy session that has no stored browser_token_hash", async () => {
+    // A row created before migration 010 (or by any path that did not set the
+    // hash) must fail closed, not sail through with the binding disabled.
+    sessions.set("legacy-state", {
+      session_id: "legacy-state",
+      state: "client-state-123",
+      redirect_uri: CLIENT_REDIRECT,
+      client_id: CLIENT_ID,
+      browser_token_hash: null,
+    });
+
+    const res = await oauth.request(`/callback?code=x&state=legacy-state`, {
+      headers: { Cookie: "wmcp_oauth_bt_legacy-state=anything" },
+    });
+
+    expect(res.status).toBe(400);
+    expect(authCodes.size).toBe(0);
+  });
+
+  test("concurrent flows in one browser both complete (no cookie clobbering)", async () => {
+    const a = await startFlow();
+    const b = await startFlow();
+
+    // Complete the FIRST flow after the second one started; its own per-flow
+    // cookie is still valid.
+    const resA = await oauth.request(`/callback?code=code-a&state=${a.internalState}`, {
+      headers: { Cookie: `${a.cookie.name}=${a.cookie.value}` },
+    });
+    const resB = await oauth.request(`/callback?code=code-b&state=${b.internalState}`, {
+      headers: { Cookie: `${b.cookie.name}=${b.cookie.value}` },
+    });
+
+    expect(resA.status).toBe(302);
+    expect(resB.status).toBe(302);
+    expect(authCodes.size).toBe(2);
+  });
+
   test("still rejects an unknown state", async () => {
     const res = await oauth.request(`/callback?code=x&state=does-not-exist`, {
-      headers: { Cookie: "wmcp_oauth_bt=whatever" },
+      headers: { Cookie: "wmcp_oauth_bt_x=whatever" },
     });
     expect(res.status).toBe(400);
   });

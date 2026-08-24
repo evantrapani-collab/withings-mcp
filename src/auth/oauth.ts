@@ -250,6 +250,31 @@ function timingSafeEqualHex(a: string, b: string): boolean {
   return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
 }
 
+// A request is treated as secure (HTTPS) unless it is explicitly plain http or
+// targets a loopback host. This matches getPublicBaseUrl's https-by-default
+// stance, so a TLS-terminating proxy that omits x-forwarded-proto still yields a
+// Secure binding cookie rather than silently downgrading it.
+function isSecureRequest(c: {
+  req: { header: (name: string) => string | undefined; url: string };
+}): boolean {
+  const host = (c.req.header("x-forwarded-host") || c.req.header("host") || "").toLowerCase();
+  if (host.startsWith("localhost") || host.startsWith("127.0.0.1") || host.startsWith("[::1]")) {
+    return false;
+  }
+  const proto = (c.req.header("x-forwarded-proto") || "").split(",")[0].trim();
+  if (proto) return proto === "https";
+  return c.req.url.startsWith("https://") || true;
+}
+
+// Per-flow cookie name. The __Host- prefix (only valid over HTTPS) forbids a
+// Domain attribute and requires Secure + Path=/, so a sibling subdomain cannot
+// fixate this cookie. The internalState suffix gives each concurrent flow its
+// own cookie instead of a single shared name that later flows would clobber.
+function bindingCookieName(internalState: string, secure: boolean): string {
+  const prefix = secure ? "__Host-" : "";
+  return `${prefix}${BROWSER_BINDING_COOKIE}_${internalState}`;
+}
+
 // Reject redirect URIs that could execute script in the context that receives
 // them. http(s) and custom application schemes (native MCP clients, per RFC
 // 8252) are allowed — the browser binding on /callback, not this list, is what
@@ -418,19 +443,21 @@ export function createOAuthRouter(config: OAuthConfig) {
       browserTokenHash: sha256Hex(browserToken),
     });
 
-    // Secure only over HTTPS so local http development still works. SameSite=Lax
-    // is required: the callback is a top-level cross-site navigation redirected
-    // from account.withings.com, which Strict would strip the cookie from.
-    const isHttps =
-      (c.req.header("x-forwarded-proto") || "").split(",")[0].trim() === "https" ||
-      c.req.url.startsWith("https://");
-    setCookie(c, BROWSER_BINDING_COOKIE, browserToken, {
+    // Secure over HTTPS (default) so local http development still works.
+    // SameSite=Lax is required: the callback is a top-level cross-site
+    // navigation redirected from account.withings.com, which Strict would strip
+    // the cookie from.
+    const secure = isSecureRequest(c);
+    setCookie(c, bindingCookieName(internalState, secure), browserToken, {
       httpOnly: true,
-      secure: isHttps,
+      secure,
       sameSite: "Lax",
       path: "/",
       maxAge: SESSION_TTL_MS / 1000,
     });
+
+    // The response carries a secret cookie — never let a cache store it.
+    c.header("Cache-Control", "no-store");
 
     // Redirect to Withings OAuth
     const withingsAuthUrl = new URL(WITHINGS_AUTH_URL);
@@ -461,17 +488,19 @@ export function createOAuthRouter(config: OAuthConfig) {
     }
 
     // Enforce the browser binding established at /authorize. Without a cookie
-    // matching this flow, reject and consume the session so a mismatched flow
-    // cannot be retried. This is what stops a third party from having a victim's
-    // browser complete a flow the attacker initiated.
-    const browserToken = getCookie(c, BROWSER_BINDING_COOKIE);
+    // matching this flow, reject — this stops a third party from having a
+    // victim's browser complete a flow the attacker initiated. The session is
+    // left to expire on its own (10-minute TTL); consuming it here would let a
+    // sibling flow's stray request cancel an unrelated in-flight login.
+    const secure = isSecureRequest(c);
+    const cookieName = bindingCookieName(internalState, secure);
+    const browserToken = getCookie(c, cookieName);
     if (
       !session.browserTokenHash ||
       !browserToken ||
       !timingSafeEqualHex(sha256Hex(browserToken), session.browserTokenHash)
     ) {
-      await oauthStore.deleteSession(internalState);
-      deleteCookie(c, BROWSER_BINDING_COOKIE, { path: "/" });
+      deleteCookie(c, cookieName, { path: "/", secure });
       logger.warn("OAuth callback rejected: browser binding missing or mismatched");
       return c.json(
         {
@@ -482,7 +511,7 @@ export function createOAuthRouter(config: OAuthConfig) {
         400
       );
     }
-    deleteCookie(c, BROWSER_BINDING_COOKIE, { path: "/" });
+    deleteCookie(c, cookieName, { path: "/", secure });
 
     logger.info("Processing OAuth callback from Withings");
 
