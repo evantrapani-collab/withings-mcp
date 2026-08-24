@@ -10,3 +10,8 @@
 -- before this column exists (or without a cookie) are rejected at /callback,
 -- which for a 10-minute-TTL session only asks the user to click connect again.
 ALTER TABLE oauth_sessions ADD COLUMN IF NOT EXISTS browser_token_hash TEXT;
+
+-- Set when the user approves the flow on the first-party consent screen.
+-- /callback requires it, so an authorization code is only ever issued for a flow
+-- the user explicitly consented to — not one whose secret state was observed.
+ALTER TABLE oauth_sessions ADD COLUMN IF NOT EXISTS consented_at TIMESTAMPTZ;

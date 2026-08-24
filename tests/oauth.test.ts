@@ -68,6 +68,12 @@ function buildFake() {
         const row = sessions.get(String(filterValue(op, "session_id")));
         return row ? { data: row, error: null } : notFound;
       }
+      if (op.action === "update") {
+        const id = String(filterValue(op, "session_id"));
+        const row = sessions.get(id);
+        if (row) sessions.set(id, { ...row, ...(op.payload as Record<string, unknown>) });
+        return { data: null, error: null };
+      }
       if (op.action === "delete") {
         sessions.delete(String(filterValue(op, "session_id")));
         return { data: null, error: null };
@@ -152,12 +158,6 @@ function bindingCookie(res: Response): { name: string; value: string } | null {
   return m ? { name: m[1], value: m[2] } : null;
 }
 
-function stateFromRedirect(res: Response): string {
-  const loc = res.headers.get("location");
-  if (!loc) throw new Error("no location header on authorize redirect");
-  return new URL(loc).searchParams.get("state") ?? "";
-}
-
 function flowFromCookieName(name: string): string {
   return name.replace(/^__Host-/, "").replace(/^wmcp_oauth_bt_/, "");
 }
@@ -233,6 +233,31 @@ describe("OAuth /authorize (consent screen)", () => {
     expect(a.cookie.name).not.toBe(b.cookie.name);
   });
 
+  test("shows the full URI (never blank) for a custom-scheme redirect", async () => {
+    const reg = await oauth.request("/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ redirect_uris: ["com.example.app:/oauth"] }),
+    });
+    const clientId = (await jsonBody(reg)).client_id as string;
+    const res = await oauth.request(
+      "/authorize?" +
+        new URLSearchParams({
+          response_type: "code",
+          client_id: clientId,
+          redirect_uri: "com.example.app:/oauth",
+          state: "s",
+          code_challenge: "abc",
+          code_challenge_method: "S256",
+        }).toString()
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("com.example.app:/oauth");
+    // The headline destination element must not be empty (custom schemes have no host).
+    expect(html).not.toContain("<strong></strong>");
+  });
+
   test("rejects a request with no PKCE code_challenge", async () => {
     const res = await oauth.request(authorizeUrl({ code_challenge: null }));
     expect(res.status).toBe(400);
@@ -289,7 +314,9 @@ describe("OAuth /authorize/decision (consent gate)", () => {
 
 describe("OAuth /callback browser binding", () => {
   test("completes when the same browser (matching cookie) returns", async () => {
-    const { internalState, cookie } = await startFlow();
+    const flow = await startFlow();
+    await approve(flow);
+    const { internalState, cookie } = flow;
 
     const res = await oauth.request(`/callback?code=withings-code&state=${internalState}`, {
       headers: { Cookie: `${cookie.name}=${cookie.value}` },
@@ -350,9 +377,23 @@ describe("OAuth /callback browser binding", () => {
     expect(authCodes.size).toBe(0);
   });
 
+  test("rejects a consented-cookie-valid callback for a flow that never consented", async () => {
+    // The consent gate is a server-side invariant: even with a valid binding
+    // cookie, a flow that skipped the consent POST gets no code.
+    const flow = await startFlow(); // consent page shown, but approve() NOT called
+    const res = await oauth.request(`/callback?code=x&state=${flow.internalState}`, {
+      headers: { Cookie: `${flow.cookie.name}=${flow.cookie.value}` },
+    });
+    expect(res.status).toBe(400);
+    expect((await jsonBody(res)).error).toBe("invalid_state");
+    expect(authCodes.size).toBe(0);
+  });
+
   test("concurrent flows in one browser both complete (no cookie clobbering)", async () => {
     const a = await startFlow();
     const b = await startFlow();
+    await approve(a);
+    await approve(b);
 
     // Complete the FIRST flow after the second one started; its own per-flow
     // cookie is still valid.

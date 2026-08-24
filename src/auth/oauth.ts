@@ -34,6 +34,7 @@ interface OAuthSession {
   redirectUri: string;
   clientId?: string;
   browserTokenHash?: string;
+  consented?: boolean;
 }
 
 interface OAuthSessionRow {
@@ -44,6 +45,7 @@ interface OAuthSessionRow {
   redirect_uri: string;
   client_id: string | null;
   browser_token_hash: string | null;
+  consented_at: string | null;
 }
 
 interface AuthCode {
@@ -122,7 +124,24 @@ class OAuthStore {
       redirectUri: row.redirect_uri,
       clientId: row.client_id || undefined,
       browserTokenHash: row.browser_token_hash || undefined,
+      consented: Boolean(row.consented_at),
     };
+  }
+
+  // Record that the user approved this flow on the consent screen. /callback
+  // requires this, so an authorization code is issued only for a flow the user
+  // explicitly consented to — not merely one whose secret state was observed.
+  async markConsented(sessionId: string): Promise<void> {
+    const supabase = getSupabaseClient();
+
+    const { error } = await supabase
+      .from("oauth_sessions")
+      .update({ consented_at: new Date().toISOString() })
+      .eq("session_id", sessionId);
+
+    if (error) {
+      throw new Error(`Failed to mark OAuth session consented: ${error.message}`);
+    }
   }
 
   async deleteSession(sessionId: string): Promise<void> {
@@ -263,7 +282,9 @@ function isSecureRequest(c: {
   }
   const proto = (c.req.header("x-forwarded-proto") || "").split(",")[0].trim();
   if (proto) return proto === "https";
-  return c.req.url.startsWith("https://") || true;
+  // No proxy scheme header and not a loopback host: default to secure, matching
+  // getPublicBaseUrl's https-by-default stance.
+  return true;
 }
 
 // Per-flow cookie name. The __Host- prefix (only valid over HTTPS) forbids a
@@ -332,11 +353,15 @@ function renderConsentPage(params: {
   try {
     host = new URL(params.redirectUri).host;
   } catch {
-    host = params.redirectUri;
+    host = "";
   }
+  // Custom application schemes (native clients, e.g. com.example.app:/cb) have an
+  // empty URL host — fall back to the full URI so the destination is never blank,
+  // which is the whole signal this screen exists to show.
+  const headline = host || params.redirectUri;
   const flow = htmlEscape(params.internalState);
   const client = htmlEscape(params.clientId);
-  const uriHost = htmlEscape(host);
+  const uriHost = htmlEscape(headline);
   const fullUri = htmlEscape(params.redirectUri);
   return `<!doctype html>
 <html lang="en">
@@ -546,9 +571,14 @@ export function createOAuthRouter(config: OAuthConfig) {
     // Show the first-party consent screen instead of bouncing straight to
     // Withings. The user must explicitly approve — and see the destination —
     // before the flow proceeds, which is what defeats a phished /authorize link.
+    // No form-action directive: the consent POST is answered with a 302 to
+    // account.withings.com, and some browsers apply form-action to that redirect
+    // target — which would break the flow. The form's action is a hardcoded,
+    // escaped, same-origin path and no script can run (default-src 'none'), so
+    // form-action adds no protection here anyway.
     c.header(
       "Content-Security-Policy",
-      "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'"
+      "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'"
     );
     return c.html(renderConsentPage({ internalState, clientId, redirectUri }));
     }
@@ -561,9 +591,13 @@ export function createOAuthRouter(config: OAuthConfig) {
     "/authorize/decision",
     rateLimit({ maxRequests: 15, windowMs: 300000 }),
     async (c) => {
-      const body = await c.req.parseBody();
+      const body = (await c.req
+        .parseBody()
+        .catch(() => ({}))) as Record<string, unknown>;
       const internalState = typeof body.flow === "string" ? body.flow : "";
       const decision = typeof body.decision === "string" ? body.decision : "";
+
+      c.header("Cache-Control", "no-store");
 
       if (!internalState) {
         return c.json({ error: "invalid_request", error_description: "flow is required" }, 400);
@@ -589,19 +623,22 @@ export function createOAuthRouter(config: OAuthConfig) {
         return c.json({ error: "invalid_state" }, 400);
       }
 
-      c.header("Cache-Control", "no-store");
-
       if (decision !== "allow") {
-        // User cancelled: drop the flow and return to the client with a standard
-        // error (RFC 6749 §4.1.2.1) so it can react instead of hanging.
-        await oauthStore.deleteSession(internalState);
-        deleteCookie(c, cookieName, { path: "/", secure });
+        // User cancelled: return to the client with a standard error (RFC 6749
+        // §4.1.2.1) so it can react instead of hanging. Build the redirect
+        // before dropping the flow, so a malformed stored redirect_uri cannot
+        // leave the session orphaned.
         const denied = new URL(session.redirectUri);
         denied.searchParams.append("error", "access_denied");
         denied.searchParams.append("state", session.state);
+        await oauthStore.deleteSession(internalState);
+        deleteCookie(c, cookieName, { path: "/", secure });
         return c.redirect(denied.toString());
       }
 
+      // Record the approval so /callback issues a code only for a consented
+      // flow, rather than any flow whose secret state was observed.
+      await oauthStore.markConsented(internalState);
       logger.info("OAuth consent granted; redirecting to Withings");
       return c.redirect(buildWithingsAuthUrl(config, internalState));
     }
@@ -648,6 +685,17 @@ export function createOAuthRouter(config: OAuthConfig) {
       );
     }
     deleteCookie(c, cookieName, { path: "/", secure });
+
+    // The flow must have passed through the consent screen. This makes the
+    // consent gate an explicit server-side invariant rather than one that holds
+    // only because the internal state stayed secret.
+    if (!session.consented) {
+      logger.warn("OAuth callback rejected: flow was not consented");
+      return c.json(
+        { error: "invalid_state", error_description: "authorization was not consented" },
+        400
+      );
+    }
 
     logger.info("Processing OAuth callback from Withings");
 
