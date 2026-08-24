@@ -158,26 +158,53 @@ function stateFromRedirect(res: Response): string {
   return new URL(loc).searchParams.get("state") ?? "";
 }
 
-/** Run /authorize and return the internal state + browser cookie it issues. */
+function flowFromCookieName(name: string): string {
+  return name.replace(/^__Host-/, "").replace(/^wmcp_oauth_bt_/, "");
+}
+
+/**
+ * Run /authorize (which now renders the consent screen) and return the internal
+ * state + browser cookie it issues. The internal state is recovered from the
+ * per-flow cookie name since /authorize no longer redirects.
+ */
 async function startFlow(
   init?: RequestInit
 ): Promise<{ internalState: string; cookie: { name: string; value: string } }> {
   const res = await oauth.request(authorizeUrl(), init);
-  expect(res.status).toBe(302);
-  const internalState = stateFromRedirect(res);
+  expect(res.status).toBe(200);
   const cookie = bindingCookie(res);
-  expect(internalState).toBeTruthy();
   expect(cookie).toBeTruthy();
-  return { internalState, cookie: cookie as { name: string; value: string } };
+  const c = cookie as { name: string; value: string };
+  const internalState = flowFromCookieName(c.name);
+  expect(internalState).toBeTruthy();
+  return { internalState, cookie: c };
 }
 
-describe("OAuth /authorize", () => {
-  test("redirects to Withings and sets an HttpOnly SameSite=Lax binding cookie", async () => {
+/** Approve consent for a started flow; returns the /authorize/decision response. */
+async function approve(flow: {
+  internalState: string;
+  cookie: { name: string; value: string };
+}): Promise<Response> {
+  return oauth.request("/authorize/decision", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Cookie: `${flow.cookie.name}=${flow.cookie.value}`,
+    },
+    body: new URLSearchParams({ flow: flow.internalState, decision: "allow" }).toString(),
+  });
+}
+
+describe("OAuth /authorize (consent screen)", () => {
+  test("renders a consent page (not a redirect) and sets the binding cookie", async () => {
     const res = await oauth.request(authorizeUrl());
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toStartWith(
-      "https://account.withings.com/oauth2_user/authorize2"
-    );
+    expect(res.status).toBe(200);
+    // It must NOT bounce straight to Withings anymore.
+    expect(res.headers.get("location")).toBeNull();
+    const html = await res.text();
+    expect(html).toContain("Authorize access to your Withings");
+    // The destination the code will be sent to is shown to the user.
+    expect(html).toContain("client.example");
     const setCookie = res.headers.get("set-cookie") ?? "";
     expect(setCookie).toContain("wmcp_oauth_bt_");
     expect(setCookie).toContain("HttpOnly");
@@ -193,7 +220,7 @@ describe("OAuth /authorize", () => {
       headers: { host: "withings-mcp.example", "x-forwarded-proto": "https" },
     });
     const setCookie = res.headers.get("set-cookie") ?? "";
-    const internalState = stateFromRedirect(res);
+    const internalState = flowFromCookieName((bindingCookie(res) as { name: string }).name);
     // __Host- prefix (blocks sibling-subdomain fixation) + Secure over HTTPS.
     expect(setCookie).toContain(`__Host-wmcp_oauth_bt_${internalState}=`);
     expect(setCookie).toContain("Secure");
@@ -215,6 +242,48 @@ describe("OAuth /authorize", () => {
   test("rejects a non-S256 code_challenge_method", async () => {
     const res = await oauth.request(authorizeUrl({ code_challenge_method: "plain" }));
     expect(res.status).toBe(400);
+  });
+});
+
+describe("OAuth /authorize/decision (consent gate)", () => {
+  test("Allow (with matching cookie) proceeds to Withings", async () => {
+    const flow = await startFlow();
+    const res = await approve(flow);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toStartWith(
+      "https://account.withings.com/oauth2_user/authorize2"
+    );
+    expect(new URL(res.headers.get("location") as string).searchParams.get("state")).toBe(
+      flow.internalState
+    );
+  });
+
+  test("Cancel returns to the client with error=access_denied and drops the flow", async () => {
+    const flow = await startFlow();
+    const res = await oauth.request("/authorize/decision", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `${flow.cookie.name}=${flow.cookie.value}`,
+      },
+      body: new URLSearchParams({ flow: flow.internalState, decision: "deny" }).toString(),
+    });
+    expect(res.status).toBe(302);
+    const loc = new URL(res.headers.get("location") as string);
+    expect(loc.origin + loc.pathname).toBe(CLIENT_REDIRECT);
+    expect(loc.searchParams.get("error")).toBe("access_denied");
+    expect(sessions.has(flow.internalState)).toBe(false);
+  });
+
+  test("Allow WITHOUT the binding cookie is rejected (cannot forge consent cross-site)", async () => {
+    const flow = await startFlow();
+    const res = await oauth.request("/authorize/decision", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ flow: flow.internalState, decision: "allow" }).toString(),
+    });
+    expect(res.status).toBe(400);
+    expect(res.headers.get("location")).toBeNull();
   });
 });
 

@@ -295,6 +295,90 @@ function isSafeRedirectUri(uri: string): boolean {
   );
 }
 
+const WITHINGS_SCOPE = "user.metrics,user.activity,user.sleepevents,user.info";
+
+function buildWithingsAuthUrl(config: OAuthConfig, internalState: string): string {
+  const url = new URL(WITHINGS_AUTH_URL);
+  url.searchParams.append("response_type", "code");
+  url.searchParams.append("client_id", config.clientId);
+  url.searchParams.append("redirect_uri", config.redirectUri);
+  url.searchParams.append("scope", WITHINGS_SCOPE);
+  url.searchParams.append("state", internalState);
+  return url.toString();
+}
+
+function htmlEscape(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// First-party consent interstitial, shown BEFORE the Withings hop. The browser
+// binding proves the callback returns to the same browser; it cannot prove the
+// user meant to authorize THIS client. Showing the requesting client and the
+// destination the authorization will be sent to — and requiring an explicit
+// click — is what stops an attacker phishing a victim to a crafted /authorize
+// link (the code would otherwise be delivered to the attacker's redirect_uri
+// with the victim never seeing where their data went).
+function renderConsentPage(params: {
+  internalState: string;
+  clientId: string;
+  redirectUri: string;
+}): string {
+  let host: string;
+  try {
+    host = new URL(params.redirectUri).host;
+  } catch {
+    host = params.redirectUri;
+  }
+  const flow = htmlEscape(params.internalState);
+  const client = htmlEscape(params.clientId);
+  const uriHost = htmlEscape(host);
+  const fullUri = htmlEscape(params.redirectUri);
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorize access to your Withings data</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1.25rem; color: #1a1a1a; line-height: 1.5; }
+  .card { border: 1px solid #e0e0e0; border-radius: 12px; padding: 1.5rem; }
+  h1 { font-size: 1.2rem; margin: 0 0 1rem; }
+  .dest { background: #f6f6f6; border-radius: 8px; padding: .75rem 1rem; margin: 1rem 0; word-break: break-all; }
+  .dest strong { font-size: 1.05rem; }
+  .muted { color: #666; font-size: .85rem; }
+  .row { display: flex; gap: .75rem; margin-top: 1.5rem; }
+  button { flex: 1; padding: .7rem 1rem; font-size: 1rem; border-radius: 8px; border: 0; cursor: pointer; }
+  .allow { background: #0a7d34; color: #fff; }
+  .deny { background: #eee; color: #1a1a1a; }
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Authorize access to your Withings health data</h1>
+<p>An application is requesting read access to your Withings data (weight, activity, sleep, and heart measurements).</p>
+<div class="dest">
+  Your authorization will be sent to:<br><strong>${uriHost}</strong>
+  <div class="muted">${fullUri}</div>
+  <div class="muted">Client ID: ${client}</div>
+</div>
+<p class="muted">Only continue if you started this from an app you trust and you recognize the destination above.</p>
+<form method="POST" action="/authorize/decision">
+  <input type="hidden" name="flow" value="${flow}">
+  <div class="row">
+    <button class="deny" name="decision" value="deny">Cancel</button>
+    <button class="allow" name="decision" value="allow">Allow</button>
+  </div>
+</form>
+</div>
+</body>
+</html>`;
+}
+
 export async function initOAuthStore() {
   await oauthStore.init();
 }
@@ -459,15 +543,67 @@ export function createOAuthRouter(config: OAuthConfig) {
     // The response carries a secret cookie — never let a cache store it.
     c.header("Cache-Control", "no-store");
 
-    // Redirect to Withings OAuth
-    const withingsAuthUrl = new URL(WITHINGS_AUTH_URL);
-    withingsAuthUrl.searchParams.append("response_type", "code");
-    withingsAuthUrl.searchParams.append("client_id", config.clientId);
-    withingsAuthUrl.searchParams.append("redirect_uri", config.redirectUri);
-    withingsAuthUrl.searchParams.append("scope", "user.metrics,user.activity,user.sleepevents,user.info");
-    withingsAuthUrl.searchParams.append("state", internalState);
+    // Show the first-party consent screen instead of bouncing straight to
+    // Withings. The user must explicitly approve — and see the destination —
+    // before the flow proceeds, which is what defeats a phished /authorize link.
+    c.header(
+      "Content-Security-Policy",
+      "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'"
+    );
+    return c.html(renderConsentPage({ internalState, clientId, redirectUri }));
+    }
+  );
 
-    return c.redirect(withingsAuthUrl.toString());
+  // Consent decision — the user clicked Allow or Cancel on the interstitial.
+  // Only from here does the flow proceed to Withings, so the consent screen
+  // cannot be skipped.
+  oauth.post(
+    "/authorize/decision",
+    rateLimit({ maxRequests: 15, windowMs: 300000 }),
+    async (c) => {
+      const body = await c.req.parseBody();
+      const internalState = typeof body.flow === "string" ? body.flow : "";
+      const decision = typeof body.decision === "string" ? body.decision : "";
+
+      if (!internalState) {
+        return c.json({ error: "invalid_request", error_description: "flow is required" }, 400);
+      }
+
+      const session = await oauthStore.getSession(internalState);
+      if (!session) {
+        logger.warn("OAuth decision failed: invalid or expired flow");
+        return c.json({ error: "invalid_state" }, 400);
+      }
+
+      // Same browser binding as /callback: the approval must come from the
+      // browser that started the flow, not a cross-site forged POST.
+      const secure = isSecureRequest(c);
+      const cookieName = bindingCookieName(internalState, secure);
+      const browserToken = getCookie(c, cookieName);
+      if (
+        !session.browserTokenHash ||
+        !browserToken ||
+        !timingSafeEqualHex(sha256Hex(browserToken), session.browserTokenHash)
+      ) {
+        logger.warn("OAuth decision rejected: browser binding missing or mismatched");
+        return c.json({ error: "invalid_state" }, 400);
+      }
+
+      c.header("Cache-Control", "no-store");
+
+      if (decision !== "allow") {
+        // User cancelled: drop the flow and return to the client with a standard
+        // error (RFC 6749 §4.1.2.1) so it can react instead of hanging.
+        await oauthStore.deleteSession(internalState);
+        deleteCookie(c, cookieName, { path: "/", secure });
+        const denied = new URL(session.redirectUri);
+        denied.searchParams.append("error", "access_denied");
+        denied.searchParams.append("state", session.state);
+        return c.redirect(denied.toString());
+      }
+
+      logger.info("OAuth consent granted; redirecting to Withings");
+      return c.redirect(buildWithingsAuthUrl(config, internalState));
     }
   );
 
