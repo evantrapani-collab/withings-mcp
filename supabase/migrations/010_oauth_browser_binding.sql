@@ -1,0 +1,12 @@
+-- Bind each OAuth authorization flow to the browser that initiated it.
+--
+-- /authorize sets an HttpOnly SameSite=Lax cookie and stores the SHA-256 of its
+-- value here; /callback requires the request to present a cookie whose hash
+-- matches before it will issue an authorization code. This defeats
+-- authorization-code injection, where a third party initiates a flow with their
+-- own registered redirect_uri and has a victim's browser complete it.
+--
+-- Nullable so the migration is safe to apply to a live table; sessions created
+-- before this column exists (or without a cookie) are rejected at /callback,
+-- which for a 10-minute-TTL session only asks the user to click connect again.
+ALTER TABLE oauth_sessions ADD COLUMN IF NOT EXISTS browser_token_hash TEXT;

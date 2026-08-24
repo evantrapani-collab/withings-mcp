@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { tokenStore } from "./token-store.js";
 import crypto from "node:crypto";
 import { getSupabaseClient } from "../db/supabase.js";
@@ -14,6 +15,12 @@ const WITHINGS_TOKEN_URL = "https://wbsapi.withings.net/v2/oauth2";
 
 const SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
+// Cookie that binds an authorization flow to the browser that started it. It is
+// set on the /authorize response and required (and matched) on the Withings
+// /callback, so a flow initiated server-side by a third party cannot be
+// completed by a victim's browser (authorization-code injection).
+const BROWSER_BINDING_COOKIE = "wmcp_oauth_bt";
+
 export interface OAuthConfig {
   clientId: string;
   clientSecret: string;
@@ -26,6 +33,7 @@ interface OAuthSession {
   codeChallengeMethod?: string;
   redirectUri: string;
   clientId?: string;
+  browserTokenHash?: string;
 }
 
 interface OAuthSessionRow {
@@ -35,6 +43,7 @@ interface OAuthSessionRow {
   code_challenge_method: string | null;
   redirect_uri: string;
   client_id: string | null;
+  browser_token_hash: string | null;
 }
 
 interface AuthCode {
@@ -80,6 +89,7 @@ class OAuthStore {
       code_challenge_method: session.codeChallengeMethod || null,
       redirect_uri: session.redirectUri,
       client_id: session.clientId || null,
+      browser_token_hash: session.browserTokenHash || null,
       expires_at: expiresAt,
     });
 
@@ -111,6 +121,7 @@ class OAuthStore {
       codeChallengeMethod: row.code_challenge_method || undefined,
       redirectUri: row.redirect_uri,
       clientId: row.client_id || undefined,
+      browserTokenHash: row.browser_token_hash || undefined,
     };
   }
 
@@ -229,6 +240,36 @@ function sha256(buffer: string): Buffer {
   return crypto.createHash('sha256').update(buffer).digest();
 }
 
+function sha256Hex(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+// Constant-time comparison of two equal-length hex digests.
+function timingSafeEqualHex(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+// Reject redirect URIs that could execute script in the context that receives
+// them. http(s) and custom application schemes (native MCP clients, per RFC
+// 8252) are allowed — the browser binding on /callback, not this list, is what
+// defeats open-redirect abuse of a registered https URI.
+function isSafeRedirectUri(uri: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(uri);
+  } catch {
+    return false;
+  }
+  const scheme = parsed.protocol.toLowerCase();
+  return (
+    scheme !== "javascript:" &&
+    scheme !== "data:" &&
+    scheme !== "vbscript:" &&
+    scheme !== "file:"
+  );
+}
+
 export async function initOAuthStore() {
   await oauthStore.init();
 }
@@ -253,6 +294,21 @@ export function createOAuthRouter(config: OAuthConfig) {
           typeof (body as { client_name?: unknown }).client_name === "string"
             ? (body as { client_name: string }).client_name
             : undefined;
+
+        // A client with no usable redirect_uri can never complete a flow
+        // (/authorize rejects any redirect_uri not registered here), and
+        // script-scheme URIs are never legitimate — reject both at registration.
+        if (redirectUris.length === 0 || !redirectUris.every(isSafeRedirectUri)) {
+          logger.warn("OAuth client registration rejected: invalid redirect_uris");
+          return c.json(
+            {
+              error: "invalid_redirect_uri",
+              error_description:
+                "redirect_uris must be a non-empty list of URIs and may not use the javascript, data, vbscript, or file scheme",
+            },
+            400
+          );
+        }
 
         const clientId = crypto.randomUUID();
         const clientSecret = crypto.randomUUID();
@@ -331,18 +387,49 @@ export function createOAuthRouter(config: OAuthConfig) {
       return c.json({ error: "invalid_request", error_description: "redirect_uri is not registered for this client" }, 400);
     }
 
+    // Require PKCE. The MCP authorization spec mandates it, and an authorization
+    // code with no challenge is redeemable by anyone who intercepts it.
+    if (!codeChallenge) {
+      logger.warn("OAuth authorization failed: missing code_challenge (PKCE required)");
+      return c.json({ error: "invalid_request", error_description: "code_challenge is required (PKCE)" }, 400);
+    }
+    if (codeChallengeMethod && codeChallengeMethod !== "S256") {
+      logger.warn("OAuth authorization failed: unsupported code_challenge_method");
+      return c.json({ error: "invalid_request", error_description: "code_challenge_method must be S256" }, 400);
+    }
+
     logger.info("Starting OAuth authorization flow");
 
     // Generate internal state for Withings OAuth
     const internalState = crypto.randomUUID();
 
+    // Bind this flow to the browser that started it. The Withings callback must
+    // arrive carrying this cookie, so an attacker who initiates a flow
+    // server-side cannot have a victim's browser complete it.
+    const browserToken = base64URLEncode(crypto.randomBytes(32));
+
     // Store OAuth session
     await oauthStore.storeSession(internalState, {
       state,
       codeChallenge,
-      codeChallengeMethod,
+      codeChallengeMethod: "S256",
       redirectUri,
       clientId,
+      browserTokenHash: sha256Hex(browserToken),
+    });
+
+    // Secure only over HTTPS so local http development still works. SameSite=Lax
+    // is required: the callback is a top-level cross-site navigation redirected
+    // from account.withings.com, which Strict would strip the cookie from.
+    const isHttps =
+      (c.req.header("x-forwarded-proto") || "").split(",")[0].trim() === "https" ||
+      c.req.url.startsWith("https://");
+    setCookie(c, BROWSER_BINDING_COOKIE, browserToken, {
+      httpOnly: true,
+      secure: isHttps,
+      sameSite: "Lax",
+      path: "/",
+      maxAge: SESSION_TTL_MS / 1000,
     });
 
     // Redirect to Withings OAuth
@@ -372,6 +459,30 @@ export function createOAuthRouter(config: OAuthConfig) {
       logger.warn("OAuth callback failed: invalid or expired state");
       return c.json({ error: "invalid_state" }, 400);
     }
+
+    // Enforce the browser binding established at /authorize. Without a cookie
+    // matching this flow, reject and consume the session so a mismatched flow
+    // cannot be retried. This is what stops a third party from having a victim's
+    // browser complete a flow the attacker initiated.
+    const browserToken = getCookie(c, BROWSER_BINDING_COOKIE);
+    if (
+      !session.browserTokenHash ||
+      !browserToken ||
+      !timingSafeEqualHex(sha256Hex(browserToken), session.browserTokenHash)
+    ) {
+      await oauthStore.deleteSession(internalState);
+      deleteCookie(c, BROWSER_BINDING_COOKIE, { path: "/" });
+      logger.warn("OAuth callback rejected: browser binding missing or mismatched");
+      return c.json(
+        {
+          error: "invalid_state",
+          error_description:
+            "authorization must be completed in the browser that started it",
+        },
+        400
+      );
+    }
+    deleteCookie(c, BROWSER_BINDING_COOKIE, { path: "/" });
 
     logger.info("Processing OAuth callback from Withings");
 
@@ -599,6 +710,35 @@ export function createOAuthRouter(config: OAuthConfig) {
       logger.error("Token exchange error", { error: String(error) });
       return c.json({ error: "server_error", error_description: "Failed to exchange authorization code" }, 500);
     }
+    }
+  );
+
+  // Token revocation (RFC 7009). Possession of the token authorizes its
+  // revocation: deleting the mcp_tokens row severs the Withings credential
+  // mapping, so every subsequent /mcp request with that bearer fails auth. This
+  // is the service-side kill switch an MCP client's "disconnect" can call.
+  oauth.post(
+    "/revoke",
+    rateLimit({ maxRequests: 30, windowMs: 300000 }),
+    async (c) => {
+      const body = await c.req.parseBody();
+      const token = typeof body.token === "string" ? body.token : "";
+
+      if (token) {
+        try {
+          await tokenStore.deleteToken(token);
+          logger.info("Token revoked");
+        } catch (error) {
+          logger.warn("Token revocation failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      // RFC 7009 §2.2: respond 200 regardless of whether the token was valid, so
+      // revocation cannot be used to probe token validity.
+      c.header("Cache-Control", "no-store");
+      return c.json({}, 200);
     }
   );
 
