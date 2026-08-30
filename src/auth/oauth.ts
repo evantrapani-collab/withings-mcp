@@ -364,6 +364,25 @@ function readBindingCookie(
   return null;
 }
 
+// The browser-binding check itself: identical at /authorize/decision and
+// /callback, which otherwise differ in what they log and return on failure —
+// so only the check, not the response, is shared.
+function verifyBinding(
+  c: Context,
+  internalState: string,
+  session: OAuthSession
+): { valid: boolean; cookieName: string; secure: boolean } {
+  const bound = readBindingCookie(c, internalState);
+  const cookieName = bound?.name ?? bindingCookieName(internalState, isSecureRequest(c));
+  const secure = cookieName.startsWith("__Host-");
+  const browserToken = bound?.value;
+  const valid =
+    Boolean(session.browserTokenHash) &&
+    Boolean(browserToken) &&
+    timingSafeEqualHex(sha256Hex(browserToken as string), session.browserTokenHash as string);
+  return { valid, cookieName, secure };
+}
+
 // Reject redirect URIs that could execute script in the context that receives
 // them. http(s) and custom application schemes (native MCP clients, per RFC
 // 8252) are allowed — the browser binding on /callback, not this list, is what
@@ -698,20 +717,9 @@ export function createOAuthRouter(config: OAuthConfig) {
       }
 
       // Same browser binding as /callback: the approval must come from the
-      // browser that started the flow, not a cross-site forged POST. Look up
-      // the cookie under either possible name (see readBindingCookie) rather
-      // than only the one implied by this request's own recomputed `secure` —
-      // a proxy that reports headers inconsistently across routes could
-      // otherwise make a legitimate flow fail closed.
-      const bound = readBindingCookie(c, internalState);
-      const cookieName = bound?.name ?? bindingCookieName(internalState, isSecureRequest(c));
-      const secure = cookieName.startsWith("__Host-");
-      const browserToken = bound?.value;
-      if (
-        !session.browserTokenHash ||
-        !browserToken ||
-        !timingSafeEqualHex(sha256Hex(browserToken), session.browserTokenHash)
-      ) {
+      // browser that started the flow, not a cross-site forged POST.
+      const { valid, cookieName, secure } = verifyBinding(c, internalState, session);
+      if (!valid) {
         logger.warn("OAuth decision rejected: browser binding missing or mismatched");
         return c.json({ error: "invalid_state" }, 400);
       }
@@ -760,18 +768,9 @@ export function createOAuthRouter(config: OAuthConfig) {
     // matching this flow, reject — this stops a third party from having a
     // victim's browser complete a flow the attacker initiated. The session is
     // left to expire on its own (10-minute TTL); consuming it here would let a
-    // sibling flow's stray request cancel an unrelated in-flight login. Look up
-    // the cookie under either possible name (see readBindingCookie) rather than
-    // only the one implied by this request's own recomputed `secure`.
-    const bound = readBindingCookie(c, internalState);
-    const cookieName = bound?.name ?? bindingCookieName(internalState, isSecureRequest(c));
-    const secure = cookieName.startsWith("__Host-");
-    const browserToken = bound?.value;
-    if (
-      !session.browserTokenHash ||
-      !browserToken ||
-      !timingSafeEqualHex(sha256Hex(browserToken), session.browserTokenHash)
-    ) {
+    // sibling flow's stray request cancel an unrelated in-flight login.
+    const { valid, cookieName, secure } = verifyBinding(c, internalState, session);
+    if (!valid) {
       deleteCookie(c, cookieName, { path: "/", secure });
       logger.warn("OAuth callback rejected: browser binding missing or mismatched");
       return c.json(

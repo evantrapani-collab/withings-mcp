@@ -189,6 +189,18 @@ async function jsonBody(res: Response): Promise<Record<string, unknown>> {
   return (await res.json()) as Record<string, unknown>;
 }
 
+/** Registers a client and returns its client_id, for tests that need a fresh
+ * client (a custom-scheme redirect_uri, a client_name) rather than the
+ * pre-registered CLIENT_ID. */
+async function registerClient(body: Record<string, unknown>): Promise<string> {
+  const res = await oauth.request("/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return (await jsonBody(res)).client_id as string;
+}
+
 // The binding cookie is per-flow: `[__Host-]wmcp_oauth_bt_<internalState>=<value>`.
 function bindingCookie(res: Response): { name: string; value: string } | null {
   const setCookie = res.headers.get("set-cookie");
@@ -273,22 +285,14 @@ describe("OAuth /authorize (consent screen)", () => {
   });
 
   test("shows the full URI (never blank) for a custom-scheme redirect", async () => {
-    const reg = await oauth.request("/register", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ redirect_uris: ["com.example.app:/oauth"] }),
-    });
-    const clientId = (await jsonBody(reg)).client_id as string;
+    const clientId = await registerClient({ redirect_uris: ["com.example.app:/oauth"] });
     const res = await oauth.request(
-      "/authorize?" +
-        new URLSearchParams({
-          response_type: "code",
-          client_id: clientId,
-          redirect_uri: "com.example.app:/oauth",
-          state: "s",
-          code_challenge: "abc",
-          code_challenge_method: "S256",
-        }).toString()
+      authorizeUrl({
+        client_id: clientId,
+        redirect_uri: "com.example.app:/oauth",
+        state: "s",
+        code_challenge: "abc",
+      })
     );
     expect(res.status).toBe(200);
     const html = await res.text();
@@ -319,26 +323,17 @@ describe("OAuth /authorize (consent screen)", () => {
   });
 
   test("shows the registered client_name on the consent screen (HTML-escaped)", async () => {
-    const reg = await oauth.request("/register", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        redirect_uris: ["https://app.example/cb"],
-        client_name: 'My "Cool" App <script>alert(1)</script>',
-      }),
+    const clientId = await registerClient({
+      redirect_uris: ["https://app.example/cb"],
+      client_name: 'My "Cool" App <script>alert(1)</script>',
     });
-    const clientId = (await jsonBody(reg)).client_id as string;
-
     const res = await oauth.request(
-      "/authorize?" +
-        new URLSearchParams({
-          response_type: "code",
-          client_id: clientId,
-          redirect_uri: "https://app.example/cb",
-          state: "s",
-          code_challenge: "abc",
-          code_challenge_method: "S256",
-        }).toString()
+      authorizeUrl({
+        client_id: clientId,
+        redirect_uri: "https://app.example/cb",
+        state: "s",
+        code_challenge: "abc",
+      })
     );
     expect(res.status).toBe(200);
     const html = await res.text();
