@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { tokenStore } from "./token-store.js";
 import crypto from "node:crypto";
@@ -67,12 +67,14 @@ interface RegisteredClient {
   clientId: string;
   clientSecret?: string;
   redirectUris: string[];
+  clientName?: string;
 }
 
 interface RegisteredClientRow {
   client_id: string;
   client_secret: string | null;
   redirect_uris: string[];
+  client_name: string | null;
 }
 
 class OAuthStore {
@@ -144,6 +146,42 @@ class OAuthStore {
     }
   }
 
+  /**
+   * Atomically consume an OAuth session: delete and return in one operation.
+   * Modeled on consumeAuthCode() — the same atomic DELETE ... RETURNING
+   * pattern, guarded by the same TTL filter. Ensures two concurrent /callback
+   * requests for the same flow cannot both pass and each mint an
+   * independently-redeemable auth code for the same underlying Withings code.
+   */
+  async consumeSession(sessionId: string): Promise<OAuthSession | null> {
+    const supabase = getSupabaseClient();
+    const now = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from("oauth_sessions")
+      .delete()
+      .eq("session_id", sessionId)
+      .gt("expires_at", now)
+      .select()
+      .single();
+
+    if (error || !data) {
+      return null;
+    }
+
+    const row = data as OAuthSessionRow;
+
+    return {
+      state: row.state,
+      codeChallenge: row.code_challenge || undefined,
+      codeChallengeMethod: row.code_challenge_method || undefined,
+      redirectUri: row.redirect_uri,
+      clientId: row.client_id || undefined,
+      browserTokenHash: row.browser_token_hash || undefined,
+      consented: Boolean(row.consented_at),
+    };
+  }
+
   async deleteSession(sessionId: string): Promise<void> {
     const supabase = getSupabaseClient();
 
@@ -213,6 +251,7 @@ class OAuthStore {
       client_id: clientId,
       client_secret: client.clientSecret || null,
       redirect_uris: client.redirectUris,
+      client_name: client.clientName || null,
       updated_at: new Date().toISOString(),
     }, {
       onConflict: "client_id",
@@ -242,6 +281,7 @@ class OAuthStore {
       clientId: row.client_id,
       clientSecret: row.client_secret || undefined,
       redirectUris: row.redirect_uris,
+      clientName: row.client_name || undefined,
     };
   }
 }
@@ -296,6 +336,34 @@ function bindingCookieName(internalState: string, secure: boolean): string {
   return `${prefix}${BROWSER_BINDING_COOKIE}_${internalState}`;
 }
 
+// /authorize sets the binding cookie under a single name, decided once by its
+// own locally-computed `secure`. The two read sites (/authorize/decision and
+// /callback) are separate requests that may see inconsistent proxy headers
+// (and therefore compute a different `secure`) than the request that set the
+// cookie — recomputing the name there and looking up only that one name can
+// miss a cookie the browser is actually presenting under the other name,
+// failing a legitimate flow closed indistinguishably from an attack. Instead,
+// try both possible names and use whichever one is actually set.
+function readBindingCookie(
+  c: Context,
+  internalState: string
+): { name: string; value: string } | null {
+  const hostName = bindingCookieName(internalState, true);
+  const plainName = bindingCookieName(internalState, false);
+
+  const hostValue = getCookie(c, hostName);
+  if (hostValue) {
+    return { name: hostName, value: hostValue };
+  }
+
+  const plainValue = getCookie(c, plainName);
+  if (plainValue) {
+    return { name: plainName, value: plainValue };
+  }
+
+  return null;
+}
+
 // Reject redirect URIs that could execute script in the context that receives
 // them. http(s) and custom application schemes (native MCP clients, per RFC
 // 8252) are allowed — the browser binding on /callback, not this list, is what
@@ -348,6 +416,7 @@ function renderConsentPage(params: {
   internalState: string;
   clientId: string;
   redirectUri: string;
+  clientName?: string;
 }): string {
   let host: string;
   try {
@@ -363,6 +432,12 @@ function renderConsentPage(params: {
   const client = htmlEscape(params.clientId);
   const uriHost = htmlEscape(headline);
   const fullUri = htmlEscape(params.redirectUri);
+  // client_name is optional per RFC 7591 — an unnamed client falls back to
+  // today's behavior of identifying itself by its raw client_id.
+  const clientName = params.clientName ? htmlEscape(params.clientName) : undefined;
+  const intro = clientName
+    ? `An application named &ldquo;<strong>${clientName}</strong>&rdquo; is requesting read access to your Withings data (weight, activity, sleep, and heart measurements).`
+    : `An application is requesting read access to your Withings data (weight, activity, sleep, and heart measurements).`;
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -385,7 +460,7 @@ function renderConsentPage(params: {
 <body>
 <div class="card">
 <h1>Authorize access to your Withings health data</h1>
-<p>An application is requesting read access to your Withings data (weight, activity, sleep, and heart measurements).</p>
+<p>${intro}</p>
 <div class="dest">
   Your authorization will be sent to:<br><strong>${uriHost}</strong>
   <div class="muted">${fullUri}</div>
@@ -451,6 +526,7 @@ export function createOAuthRouter(config: OAuthConfig) {
           clientId,
           clientSecret,
           redirectUris,
+          clientName,
         });
 
         logger.info("OAuth client registered", { clientName });
@@ -527,7 +603,12 @@ export function createOAuthRouter(config: OAuthConfig) {
       logger.warn("OAuth authorization failed: missing code_challenge (PKCE required)");
       return c.json({ error: "invalid_request", error_description: "code_challenge is required (PKCE)" }, 400);
     }
-    if (codeChallengeMethod && codeChallengeMethod !== "S256") {
+    // PKCE just became mandatory above; an RFC 7636 client that omits
+    // code_challenge_method relies on the spec's "plain" default, which this
+    // server has never implemented (/token only ever verifies S256). Reject
+    // that here with a clear error instead of letting it sail through consent
+    // and the whole Withings round trip only to fail confusingly at /token.
+    if (codeChallengeMethod !== "S256") {
       logger.warn("OAuth authorization failed: unsupported code_challenge_method");
       return c.json({ error: "invalid_request", error_description: "code_challenge_method must be S256" }, 400);
     }
@@ -580,7 +661,14 @@ export function createOAuthRouter(config: OAuthConfig) {
       "Content-Security-Policy",
       "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'"
     );
-    return c.html(renderConsentPage({ internalState, clientId, redirectUri }));
+    return c.html(
+      renderConsentPage({
+        internalState,
+        clientId,
+        redirectUri,
+        clientName: registeredClient.clientName,
+      })
+    );
     }
   );
 
@@ -610,10 +698,15 @@ export function createOAuthRouter(config: OAuthConfig) {
       }
 
       // Same browser binding as /callback: the approval must come from the
-      // browser that started the flow, not a cross-site forged POST.
-      const secure = isSecureRequest(c);
-      const cookieName = bindingCookieName(internalState, secure);
-      const browserToken = getCookie(c, cookieName);
+      // browser that started the flow, not a cross-site forged POST. Look up
+      // the cookie under either possible name (see readBindingCookie) rather
+      // than only the one implied by this request's own recomputed `secure` —
+      // a proxy that reports headers inconsistently across routes could
+      // otherwise make a legitimate flow fail closed.
+      const bound = readBindingCookie(c, internalState);
+      const cookieName = bound?.name ?? bindingCookieName(internalState, isSecureRequest(c));
+      const secure = cookieName.startsWith("__Host-");
+      const browserToken = bound?.value;
       if (
         !session.browserTokenHash ||
         !browserToken ||
@@ -645,7 +738,10 @@ export function createOAuthRouter(config: OAuthConfig) {
   );
 
   // Callback from Withings
-  oauth.get("/callback", async (c) => {
+  oauth.get(
+    "/callback",
+    rateLimit({ maxRequests: 15, windowMs: 300000 }), // matches /authorize's budget: callback volume tracks authorize volume 1:1
+    async (c) => {
     const code = c.req.query("code");
     const internalState = c.req.query("state");
 
@@ -664,10 +760,13 @@ export function createOAuthRouter(config: OAuthConfig) {
     // matching this flow, reject — this stops a third party from having a
     // victim's browser complete a flow the attacker initiated. The session is
     // left to expire on its own (10-minute TTL); consuming it here would let a
-    // sibling flow's stray request cancel an unrelated in-flight login.
-    const secure = isSecureRequest(c);
-    const cookieName = bindingCookieName(internalState, secure);
-    const browserToken = getCookie(c, cookieName);
+    // sibling flow's stray request cancel an unrelated in-flight login. Look up
+    // the cookie under either possible name (see readBindingCookie) rather than
+    // only the one implied by this request's own recomputed `secure`.
+    const bound = readBindingCookie(c, internalState);
+    const cookieName = bound?.name ?? bindingCookieName(internalState, isSecureRequest(c));
+    const secure = cookieName.startsWith("__Host-");
+    const browserToken = bound?.value;
     if (
       !session.browserTokenHash ||
       !browserToken ||
@@ -684,7 +783,6 @@ export function createOAuthRouter(config: OAuthConfig) {
         400
       );
     }
-    deleteCookie(c, cookieName, { path: "/", secure });
 
     // The flow must have passed through the consent screen. This makes the
     // consent gate an explicit server-side invariant rather than one that holds
@@ -697,6 +795,17 @@ export function createOAuthRouter(config: OAuthConfig) {
       );
     }
 
+    // Atomically consume the session now that both checks have passed. This
+    // is the point past which a second concurrent request for the same flow
+    // must not also succeed — otherwise two requests could each mint an
+    // independently-redeemable auth code for the same underlying Withings
+    // code. A null result means a concurrent request already consumed it.
+    const consumedSession = await oauthStore.consumeSession(internalState);
+    if (!consumedSession) {
+      logger.warn("OAuth callback rejected: session already consumed by a concurrent/duplicate callback");
+      return c.json({ error: "invalid_state" }, 400);
+    }
+
     logger.info("Processing OAuth callback from Withings");
 
     // Generate authorization code for MCP client
@@ -705,29 +814,33 @@ export function createOAuthRouter(config: OAuthConfig) {
     // Store auth code with Withings code
     await oauthStore.storeAuthCode(authCode, {
       withingsCode: code,
-      clientId: session.clientId,
-      redirectUri: session.redirectUri,
-      codeChallenge: session.codeChallenge,
+      clientId: consumedSession.clientId,
+      redirectUri: consumedSession.redirectUri,
+      codeChallenge: consumedSession.codeChallenge,
     });
 
-    // Clean up session
-    await oauthStore.deleteSession(internalState);
-
     // Redirect back to MCP client with state parameter (required for CSRF validation)
-    const redirectUrl = new URL(session.redirectUri);
+    const redirectUrl = new URL(consumedSession.redirectUri);
     redirectUrl.searchParams.append("code", authCode);
-    redirectUrl.searchParams.append("state", session.state);
+    redirectUrl.searchParams.append("state", consumedSession.state);
 
     logger.info("Redirecting to client callback", {
       host: redirectUrl.host,
       pathname: redirectUrl.pathname,
       hasCode: Boolean(redirectUrl.searchParams.get("code")),
       hasState: Boolean(redirectUrl.searchParams.get("state")),
-      existingParams: Array.from(new URL(session.redirectUri).searchParams.keys()),
+      existingParams: Array.from(new URL(consumedSession.redirectUri).searchParams.keys()),
     });
 
+    // Only clear the binding cookie once the flow has fully succeeded, so a
+    // transient failure earlier (e.g. a Supabase error between here and
+    // consumeSession) leaves the cookie intact for a legitimate retry instead
+    // of stranding the client behind an orphaned, unredeemable auth code.
+    deleteCookie(c, cookieName, { path: "/", secure });
+
     return c.redirect(redirectUrl.toString());
-  });
+    }
+  );
 
   // Token endpoint - MCP client exchanges code for token, or refreshes it
   oauth.post(
@@ -939,7 +1052,12 @@ export function createOAuthRouter(config: OAuthConfig) {
 
       if (token) {
         try {
-          await tokenStore.deleteToken(token);
+          // A token rotated in the last 60s lives under previous_mcp_token,
+          // not mcp_token — resolve it to the currently-live value first, so
+          // revoking a recently-superseded token actually kills the live
+          // token instead of silently no-op-ing while it stays usable at /mcp.
+          const resolved = await tokenStore.resolveRefreshToken(token);
+          await tokenStore.deleteToken(resolved ? resolved.currentToken : token);
           logger.info("Token revoked");
         } catch (error) {
           logger.warn("Token revocation failed", {

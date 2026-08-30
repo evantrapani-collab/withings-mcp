@@ -13,6 +13,7 @@
  */
 
 import { describe, test, expect, beforeEach, mock } from "bun:test";
+import crypto from "node:crypto";
 import { makeFakeSupabase, type Handler } from "./helpers/fake-supabase.js";
 
 // encrypt() (used by storeAuthCode on the success path) needs a >=32 char secret.
@@ -25,6 +26,7 @@ process.env.ENCRYPTION_SECRET =
 let sessions: Map<string, Record<string, unknown>>;
 let clients: Map<string, Record<string, unknown>>;
 let authCodes: Map<string, Record<string, unknown>>;
+let mcpTokens: Map<string, Record<string, unknown>>;
 let deletedTokens: string[];
 let fake: ReturnType<typeof makeFakeSupabase>;
 
@@ -75,7 +77,15 @@ function buildFake() {
         return { data: null, error: null };
       }
       if (op.action === "delete") {
-        sessions.delete(String(filterValue(op, "session_id")));
+        // Real Supabase's `.delete().eq(...).select().single()` (used by
+        // consumeSession()) returns the deleted row, not null — look the row up
+        // BEFORE removing it so a `.select()`-chained delete can return it.
+        const id = String(filterValue(op, "session_id"));
+        const row = sessions.get(id);
+        sessions.delete(id);
+        if (op.returning) {
+          return row ? { data: row, error: null } : notFound;
+        }
         return { data: null, error: null };
       }
       return { data: null, error: null };
@@ -86,9 +96,37 @@ function buildFake() {
         authCodes.set(String(p.code), p);
         return { data: null, error: null };
       }
+      if (op.action === "delete") {
+        // Same DELETE ... RETURNING semantics as oauth_sessions above, for
+        // consumeAuthCode()'s `.delete().eq(...).select().single()`.
+        const code = String(filterValue(op, "code"));
+        const row = authCodes.get(code);
+        authCodes.delete(code);
+        if (op.returning) {
+          return row ? { data: row, error: null } : notFound;
+        }
+        return { data: null, error: null };
+      }
       return { data: null, error: null };
     },
     mcp_tokens: (op) => {
+      if (op.action === "select") {
+        // Mirrors resolveRefreshToken()'s two query shapes: by mcp_token, or
+        // by previous_mcp_token (+ previous_token_expires_at still live).
+        const byToken = filterValue(op, "mcp_token");
+        if (byToken !== undefined) {
+          const row = mcpTokens.get(String(byToken));
+          return row ? { data: row, error: null } : notFound;
+        }
+        const byPrevious = filterValue(op, "previous_mcp_token");
+        if (byPrevious !== undefined) {
+          const row = [...mcpTokens.values()].find(
+            (r) => r.previous_mcp_token === byPrevious
+          );
+          return row ? { data: row, error: null } : notFound;
+        }
+        return notFound;
+      }
       if (op.action === "delete") {
         deletedTokens.push(String(filterValue(op, "mcp_token")));
         return { data: null, error: null };
@@ -119,6 +157,7 @@ beforeEach(() => {
   sessions = new Map();
   clients = new Map();
   authCodes = new Map();
+  mcpTokens = new Map();
   deletedTokens = [];
   fake = buildFake();
   // A pre-registered legitimate client.
@@ -268,6 +307,54 @@ describe("OAuth /authorize (consent screen)", () => {
     const res = await oauth.request(authorizeUrl({ code_challenge_method: "plain" }));
     expect(res.status).toBe(400);
   });
+
+  // code_challenge_method is now mandatory, not just "must be S256 if present".
+  // An RFC 7636 client that omits it (relying on the spec's "plain" default,
+  // which /token has never implemented) used to sail through /authorize and
+  // the whole Withings round trip only to fail confusingly at /token.
+  test("rejects a request with code_challenge but no code_challenge_method", async () => {
+    const res = await oauth.request(authorizeUrl({ code_challenge_method: null }));
+    expect(res.status).toBe(400);
+    expect((await jsonBody(res)).error).toBe("invalid_request");
+  });
+
+  test("shows the registered client_name on the consent screen (HTML-escaped)", async () => {
+    const reg = await oauth.request("/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        redirect_uris: ["https://app.example/cb"],
+        client_name: 'My "Cool" App <script>alert(1)</script>',
+      }),
+    });
+    const clientId = (await jsonBody(reg)).client_id as string;
+
+    const res = await oauth.request(
+      "/authorize?" +
+        new URLSearchParams({
+          response_type: "code",
+          client_id: clientId,
+          redirect_uri: "https://app.example/cb",
+          state: "s",
+          code_challenge: "abc",
+          code_challenge_method: "S256",
+        }).toString()
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Escaped, not raw markup — the name must not be able to inject a tag.
+    expect(html).toContain("My &quot;Cool&quot; App &lt;script&gt;alert(1)&lt;/script&gt;");
+    expect(html).not.toContain("<script>alert(1)</script>");
+  });
+
+  test("falls back gracefully when the client has no client_name (no literal undefined/null)", async () => {
+    // CLIENT_ID was registered in beforeEach with no client_name.
+    const res = await oauth.request(authorizeUrl());
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).not.toContain("undefined");
+    expect(html).not.toContain("null");
+  });
 });
 
 describe("OAuth /authorize/decision (consent gate)", () => {
@@ -415,6 +502,73 @@ describe("OAuth /callback browser binding", () => {
     });
     expect(res.status).toBe(400);
   });
+
+  test("concurrent /callback requests for the SAME flow: only one succeeds", async () => {
+    // Proves consumeSession()'s atomic DELETE ... RETURNING actually prevents
+    // the double-mint race: two requests racing the same internalState must not
+    // both mint an independently-redeemable auth code for the same underlying
+    // Withings code.
+    const flow = await startFlow();
+    await approve(flow);
+    const { internalState, cookie } = flow;
+
+    const [resA, resB] = await Promise.all([
+      oauth.request(`/callback?code=withings-code-a&state=${internalState}`, {
+        headers: { Cookie: `${cookie.name}=${cookie.value}` },
+      }),
+      oauth.request(`/callback?code=withings-code-b&state=${internalState}`, {
+        headers: { Cookie: `${cookie.name}=${cookie.value}` },
+      }),
+    ]);
+
+    const succeeded = [resA, resB].filter((r) => r.status === 302);
+    const failed = [resA, resB].filter((r) => r.status === 400);
+    expect(succeeded).toHaveLength(1);
+    expect(failed).toHaveLength(1);
+    expect((await jsonBody(failed[0])).error).toBe("invalid_state");
+    expect(authCodes.size).toBe(1);
+  });
+
+  test("binding cookie is found even when isSecureRequest() diverges between legs of one flow", async () => {
+    // /authorize decides the cookie's name (and whether it gets the __Host-
+    // prefix) once, from its own request's headers. A proxy that reports
+    // x-forwarded-proto inconsistently across routes could make a LATER leg
+    // recompute `secure` differently — readBindingCookie() must still find the
+    // cookie the browser is actually presenting rather than only looking under
+    // the name this request's own (possibly wrong) recomputation implies.
+    //
+    // isSecureRequest() returns true when x-forwarded-proto is absent (default
+    // secure) and false when it is present but not "https" — so the same host,
+    // with and without that header, genuinely diverges the boolean.
+    const flow = await startFlow({
+      headers: { host: "app.example", "x-forwarded-proto": "https" },
+    });
+    expect(flow.cookie.name).toStartWith("__Host-");
+
+    const decisionRes = await oauth.request("/authorize/decision", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        host: "app.example",
+        "x-forwarded-proto": "http", // diverges from leg 1's "https"
+        Cookie: `${flow.cookie.name}=${flow.cookie.value}`,
+      },
+      body: new URLSearchParams({ flow: flow.internalState, decision: "allow" }).toString(),
+    });
+    expect(decisionRes.status).toBe(302);
+
+    const callbackRes = await oauth.request(
+      `/callback?code=withings-code&state=${flow.internalState}`,
+      {
+        headers: {
+          host: "app.example",
+          "x-forwarded-proto": "http", // diverges from leg 1's "https"
+          Cookie: `${flow.cookie.name}=${flow.cookie.value}`,
+        },
+      }
+    );
+    expect(callbackRes.status).toBe(302);
+  });
 });
 
 describe("OAuth /register redirect_uri validation", () => {
@@ -457,6 +611,96 @@ describe("OAuth /register redirect_uri validation", () => {
   });
 });
 
+describe("OAuth POST /token (authorization_code grant)", () => {
+  // Node's crypto, same approach the production code uses:
+  // base64url(sha256(code_verifier)).
+  function pkcePair(): { verifier: string; challenge: string } {
+    const verifier = crypto.randomBytes(32).toString("base64url");
+    const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
+    return { verifier, challenge };
+  }
+
+  // Runs /authorize -> /authorize/decision -> /callback for a fresh flow bound
+  // to the given PKCE code_challenge, and returns the minted MCP auth code.
+  async function completedFlow(challenge: string): Promise<string> {
+    const res = await oauth.request(authorizeUrl({ code_challenge: challenge }));
+    expect(res.status).toBe(200);
+    const cookie = bindingCookie(res) as { name: string; value: string };
+    const internalState = flowFromCookieName(cookie.name);
+    const flow = { internalState, cookie };
+    const decisionRes = await approve(flow);
+    expect(decisionRes.status).toBe(302);
+
+    const callbackRes = await oauth.request(
+      `/callback?code=withings-auth-code&state=${internalState}`,
+      { headers: { Cookie: `${cookie.name}=${cookie.value}` } }
+    );
+    expect(callbackRes.status).toBe(302);
+    const loc = new URL(callbackRes.headers.get("location") as string);
+    return loc.searchParams.get("code") as string;
+  }
+
+  test("a full PKCE round trip succeeds and returns an access_token", async () => {
+    const { verifier, challenge } = pkcePair();
+    const authCode = await completedFlow(challenge);
+
+    // Stand in for the Withings token endpoint.
+    const originalFetch = global.fetch;
+    global.fetch = mock(async () =>
+      new Response(
+        JSON.stringify({
+          status: 0,
+          body: {
+            access_token: "wat",
+            refresh_token: "wrt",
+            userid: "u1",
+            expires_in: 10800,
+          },
+        })
+      )
+    ) as unknown as typeof fetch;
+
+    try {
+      const res = await oauth.request("/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code: authCode,
+          code_verifier: verifier,
+          redirect_uri: CLIENT_REDIRECT,
+        }).toString(),
+      });
+
+      expect(res.status).toBe(200);
+      const body = await jsonBody(res);
+      expect(body.access_token).toBeTruthy();
+      expect(body.token_type).toBe("Bearer");
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  test("a wrong code_verifier is rejected with invalid_grant", async () => {
+    const { challenge } = pkcePair();
+    const authCode = await completedFlow(challenge);
+
+    const res = await oauth.request("/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: authCode,
+        code_verifier: "totally-wrong-verifier",
+        redirect_uri: CLIENT_REDIRECT,
+      }).toString(),
+    });
+
+    expect(res.status).toBe(400);
+    expect((await jsonBody(res)).error).toBe("invalid_grant");
+  });
+});
+
 describe("OAuth /revoke", () => {
   test("deletes the presented token and returns 200", async () => {
     const res = await oauth.request("/revoke", {
@@ -476,5 +720,30 @@ describe("OAuth /revoke", () => {
     });
     expect(res.status).toBe(200);
     expect(deletedTokens).toHaveLength(0);
+  });
+
+  test("revokes a token still inside its rotation grace window", async () => {
+    // Shape a rotateToken() call would leave behind: the row's own mcp_token is
+    // the NEW value; the superseded value only lives in previous_mcp_token.
+    const future = new Date(Date.now() + 60_000).toISOString();
+    mcpTokens.set("new-token", {
+      mcp_token: "new-token",
+      previous_mcp_token: "old-token",
+      previous_token_expires_at: future,
+      expires_at: future,
+    });
+
+    const res = await oauth.request("/revoke", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ token: "old-token" }).toString(),
+    });
+
+    expect(res.status).toBe(200);
+    // The CURRENT live value was deleted, not the superseded one that was
+    // presented — "old-token" never existed as any row's own mcp_token, so
+    // deleting it verbatim would silently no-op while the live token stayed
+    // usable at /mcp.
+    expect(deletedTokens).toEqual(["new-token"]);
   });
 });
