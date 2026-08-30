@@ -417,11 +417,11 @@ function buildWithingsAuthUrl(config: OAuthConfig, internalState: string): strin
 
 function htmlEscape(value: string): string {
   return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+    .replaceAll(/&/g, "&amp;")
+    .replaceAll(/</g, "&lt;")
+    .replaceAll(/>/g, "&gt;")
+    .replaceAll(/"/g, "&quot;")
+    .replaceAll(/'/g, "&#39;");
 }
 
 // First-party consent interstitial, shown BEFORE the Withings hop. The browser
