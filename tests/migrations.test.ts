@@ -40,6 +40,9 @@ const EXPECTED_ADDED_COLUMNS: Array<[table: string, column: string, why: string]
   ["mcp_sessions", "session_id", "006: session -> token registry, so a restarted instance rebuilds sessions instead of 404ing"],
   ["mcp_tokens", "previous_mcp_token", "007: rotation grace window that makes refresh_token retries idempotent"],
   ["rate_limits", "previous_count", "008: the second counter the sliding window weights"],
+  ["oauth_sessions", "browser_token_hash", "010: browser-binding cookie hash; without it /callback rejects every flow"],
+  ["oauth_sessions", "consented_at", "010: consent marker; without it /callback rejects every flow as unconsented"],
+  ["registered_clients", "client_name", "011: consent screen needs it to identify the requesting app to the user"],
 ];
 
 describe("migration files", () => {
