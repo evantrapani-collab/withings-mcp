@@ -895,35 +895,47 @@ export function createOAuthRouter(config: OAuthConfig) {
         }, 400);
       }
 
-      // Rotation is idempotent within the grace window. A client that retried
-      // because it never received (or never stored) the first response gets
-      // handed the same token the winning request was issued, instead of a
-      // terminal invalid_grant that would strand it permanently.
-      let issuedToken = resolved.currentToken;
+      // Renew the TTL and hand back the SAME token. Deliberately not a
+      // rotation: access_token and refresh_token are one opaque value here, so
+      // minting a new one invalidates the bearer every other concurrent holder
+      // is still using. Whichever of them missed the 60s single-slot grace was
+      // left holding a value that was simultaneously a dead bearer and a dead
+      // refresh token — no credential left to recover with — and span
+      // 401 -> refresh -> invalid_grant until the rate limiter cut it off
+      // (production, 2026-09-09: 78 failed refreshes in 16s, then 10x 429,
+      // after which the user had to redo the whole Withings authorization).
+      //
+      // Nothing is given up by not rotating: the refresh token IS the bearer
+      // sent on every /mcp request, so an attacker holding one already holds
+      // the other and there is no replay for rotation to detect. That stops
+      // being true only if access and refresh are issued as distinct values,
+      // which is the precondition for reintroducing rotateToken().
+      //
+      // Idempotent by construction — a retried or concurrent refresh extends
+      // the same row and returns the same token, so a lost response can no
+      // longer strand a client. `resolveRefreshToken` still maps a superseded
+      // value onto the live one, which is what recovers clients holding a
+      // token rotated away before this behaviour changed.
+      const issuedToken = resolved.currentToken;
 
-      if (!resolved.isReplay) {
-        const candidate = crypto.randomUUID();
-        const rotated = await tokenStore.rotateToken(refreshToken, candidate);
-
-        if (rotated) {
-          issuedToken = candidate;
-        } else {
-          // Lost a concurrent rotation race: `candidate` was never written, so
-          // returning it would hand the client a token that authenticates
-          // nothing. Re-resolve and return whatever the winner issued.
-          const winner = await tokenStore.resolveRefreshToken(refreshToken);
-          if (!winner) {
-            logger.warn(
-              "Token refresh failed: lost rotation race and the winning token is no longer resolvable"
-            );
-            return c.json({ error: "invalid_grant" }, 400);
-          }
-          issuedToken = winner.currentToken;
-          logger.info("Token refresh resolved a concurrent rotation race");
-        }
-      } else {
-        logger.info("Token refresh replayed within grace window");
+      const extended = await tokenStore.extendToken(issuedToken);
+      if (!extended) {
+        // The row expired or was revoked between resolving and extending.
+        logger.warn(
+          "Token refresh failed: token was no longer live when its TTL was extended"
+        );
+        return c.json({
+          error: "invalid_grant",
+          error_description:
+            "refresh_token is no longer valid; re-authorize to obtain a new one",
+        }, 400);
       }
+
+      logger.info(
+        resolved.isReplay
+          ? "Token refresh resolved a superseded token to the live one"
+          : "Token refresh extended the existing token"
+      );
 
       const MCP_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
       c.header("Cache-Control", "no-store");

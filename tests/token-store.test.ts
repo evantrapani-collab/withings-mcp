@@ -14,6 +14,14 @@
  *    mcp_tokens is already committed by then, so throwing would 500 the /token
  *    response while the client holds a token that no longer exists.
  *
+ *  - `extendToken()` is what the refresh_token grant actually calls now.
+ *    Rotation is retained here but unwired: this server issues one value as
+ *    both access_token and refresh_token, so rotating killed the bearer every
+ *    concurrent holder still held, and whoever missed the 60s grace had nothing
+ *    left to recover with (production, 2026-09-09). The rotateToken() tests
+ *    below still pin correct behaviour for the day access and refresh tokens
+ *    are issued separately — which is the precondition for wiring it back.
+ *
  * Supabase is replaced wholesale by tests/helpers/fake-supabase.ts via Bun's
  * module mocking. Note the `.js` specifier: src/ imports `../db/supabase.js` for
  * a `.ts` file, so the mock has to use the same specifier to resolve to the same
@@ -283,7 +291,9 @@ describe("rotateToken - session ownership cascade", () => {
     // propagating would 500 the /token response after the rotation succeeded —
     // the client would keep a token that no longer exists and be locked out
     // until it redid the whole Withings OAuth flow. A stale session binding
-    // costs one 403 and a reconnect instead.
+    // costs one 404 and a reconnect instead: the next /mcp request finds a row
+    // still naming the old token, declines to self-heal, and tells the client
+    // to re-initialize.
     const f = useSupabase({
       mcp_tokens: updateAffects([{ mcp_token: NEW_TOKEN }]),
       mcp_sessions: sessionsBroken,
@@ -445,5 +455,82 @@ describe("getTokens / isValid are unchanged", () => {
     useSupabase({ mcp_tokens: noRows });
 
     await expect(tokenStore.isValid("mcp-token-missing")).resolves.toBe(false);
+  });
+});
+
+/**
+ * `extendToken()` is what the refresh_token grant calls instead of rotating.
+ *
+ * Rotation is why the storm happened: access_token and refresh_token are one
+ * value, so minting a new one killed the bearer every concurrent holder still
+ * held, and whoever missed the 60s grace had no credential left to recover
+ * with. Extending renews the TTL and changes nothing else.
+ */
+describe("extendToken", () => {
+  test("renews the TTL without changing the token value", async () => {
+    const f = useSupabase({ mcp_tokens: updateAffects([{ mcp_token: OLD_TOKEN }]) });
+
+    await expect(tokenStore.extendToken(OLD_TOKEN)).resolves.toBe(true);
+
+    const [op] = f.callsFor("mcp_tokens");
+    expect(op.action).toBe("update");
+
+    const payload = op.payload as Record<string, unknown>;
+    // The public-facing value must be absent from the payload entirely — not
+    // merely unchanged. Writing it at all is how a rotation starts.
+    expect(payload).not.toHaveProperty("mcp_token");
+    expect(payload).not.toHaveProperty("previous_mcp_token");
+    expect(new Date(String(payload.expires_at)).getTime()).toBeGreaterThan(
+      Date.now() + TTL_MS - 60_000
+    );
+  });
+
+  test("targets the presented token and only while it is still live", async () => {
+    const f = useSupabase({ mcp_tokens: updateAffects([{ mcp_token: OLD_TOKEN }]) });
+
+    await tokenStore.extendToken(OLD_TOKEN);
+
+    const [op] = f.callsFor("mcp_tokens");
+    expect(findFilter(op, "mcp_token", "eq")?.value).toBe(OLD_TOKEN);
+    // Without this guard an expired grant would be silently resurrected.
+    expect(findFilter(op, "expires_at", "gt")).toBeDefined();
+  });
+
+  test("returns FALSE when the UPDATE matched no live row", async () => {
+    useSupabase({ mcp_tokens: updateAffects([]) });
+
+    // The caller must answer invalid_grant rather than report success for a
+    // token whose TTL it did not actually extend.
+    await expect(tokenStore.extendToken(OLD_TOKEN)).resolves.toBe(false);
+  });
+
+  test("returns FALSE when the driver reports no data at all", async () => {
+    useSupabase({ mcp_tokens: () => ({ data: null, error: null }) });
+
+    await expect(tokenStore.extendToken(OLD_TOKEN)).resolves.toBe(false);
+  });
+
+  test("throws when Supabase returns an error", async () => {
+    useSupabase({
+      mcp_tokens: () => ({ data: null, error: { message: "connection reset" } }),
+    });
+
+    // A database fault must not be downgraded to "not extended", which would
+    // read as a terminal invalid_grant and send the client to re-authorize.
+    await expect(tokenStore.extendToken(OLD_TOKEN)).rejects.toThrow(
+      "Failed to extend token"
+    );
+  });
+
+  test("does not touch mcp_sessions", async () => {
+    // Session ownership is keyed by token value. Since the value does not
+    // change, there is nothing to cascade — and a cascade here would be a bug.
+    const f = useSupabase({
+      mcp_tokens: updateAffects([{ mcp_token: OLD_TOKEN }]),
+      mcp_sessions: sessionsBroken,
+    });
+
+    await expect(tokenStore.extendToken(OLD_TOKEN)).resolves.toBe(true);
+    expect(f.callsFor("mcp_sessions")).toHaveLength(0);
   });
 });

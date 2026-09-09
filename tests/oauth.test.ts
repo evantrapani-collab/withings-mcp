@@ -127,6 +127,25 @@ function buildFake() {
         }
         return notFound;
       }
+      if (op.action === "update") {
+        // extendToken(): UPDATE ... WHERE mcp_token = ? AND expires_at > now
+        // RETURNING mcp_token. The fake does not apply filters itself, so the
+        // liveness guard is honoured here or the "expired row" case is vacuous.
+        const row = mcpTokens.get(String(filterValue(op, "mcp_token")));
+        const liveAfter = filterValue(op, "expires_at");
+        const isLive =
+          row !== undefined &&
+          (liveAfter === undefined ||
+            new Date(String(row.expires_at)) > new Date(String(liveAfter)));
+
+        if (!isLive) return { data: [], error: null };
+
+        Object.assign(row as Record<string, unknown>, op.payload as Record<string, unknown>);
+        return {
+          data: op.returning ? [{ mcp_token: row!.mcp_token }] : null,
+          error: null,
+        };
+      }
       if (op.action === "delete") {
         deletedTokens.push(String(filterValue(op, "mcp_token")));
         return { data: null, error: null };
@@ -740,5 +759,150 @@ describe("OAuth /revoke", () => {
     // deleting it verbatim would silently no-op while the live token stayed
     // usable at /mcp.
     expect(deletedTokens).toEqual(["new-token"]);
+  });
+});
+
+/**
+ * The refresh_token grant no longer rotates.
+ *
+ * It used to mint a new opaque value on every refresh. But this project issues
+ * ONE value as both access_token and refresh_token, so each rotation
+ * invalidated the bearer that every other concurrent holder was still using.
+ * Whichever holder missed the 60s single-slot grace was left with a value that
+ * was at once a dead bearer and a dead refresh token — nothing left to recover
+ * with — and span 401 -> refresh -> invalid_grant until the rate limiter cut it
+ * off. Production, 2026-09-09: 78 failed refreshes in 16 seconds, then 10x 429,
+ * after which the user had to redo the entire Withings authorization.
+ */
+const { encrypt } = await import("../src/utils/encryption.js");
+
+describe("/token refresh_token grant", () => {
+  const LIVE = "live-token";
+
+  function seedLiveToken(overrides: Record<string, unknown> = {}) {
+    const row = {
+      mcp_token: LIVE,
+      // Full Withings payload, so isValid()/getTokens() can decrypt the row
+      // rather than throwing on absent columns.
+      encrypted_access_token: encrypt("withings-access"),
+      encrypted_refresh_token: encrypt("withings-refresh"),
+      withings_user_id: "9001",
+      withings_expires_at: Date.now() + 60 * 60_000,
+      expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+      ...overrides,
+    };
+    mcpTokens.set(String(row.mcp_token), row);
+    return row;
+  }
+
+  function refresh(token: string) {
+    return oauth.request("/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: token,
+      }).toString(),
+    });
+  }
+
+  test("returns the SAME token rather than rotating to a new one", async () => {
+    // The core regression guard. A rotating implementation passes almost
+    // everything else in this file and still strands concurrent holders.
+    seedLiveToken();
+
+    const res = await refresh(LIVE);
+    expect(res.status).toBe(200);
+
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.access_token).toBe(LIVE);
+    expect(body.refresh_token).toBe(LIVE);
+  });
+
+  test("the token a client was already using stays valid across a refresh", async () => {
+    // The storm's actual cause: a refresh used to invalidate the live bearer.
+    seedLiveToken();
+
+    await refresh(LIVE);
+
+    const { tokenStore } = await import("../src/auth/token-store.js");
+    expect(await tokenStore.isValid(LIVE)).toBe(true);
+  });
+
+  test("extends the TTL", async () => {
+    const soon = new Date(Date.now() + 60_000).toISOString();
+    seedLiveToken({ expires_at: soon });
+
+    await refresh(LIVE);
+
+    const row = mcpTokens.get(LIVE) as Record<string, unknown>;
+    expect(new Date(String(row.expires_at)).getTime()).toBeGreaterThan(
+      new Date(soon).getTime()
+    );
+  });
+
+  test("is idempotent: repeated refreshes keep returning the same token", async () => {
+    // A client whose first response was lost retries and is handed the same
+    // value, instead of a terminal invalid_grant. This is what makes a dropped
+    // response survivable at all.
+    seedLiveToken();
+
+    const first = (await (await refresh(LIVE)).json()) as Record<string, unknown>;
+    const second = (await (await refresh(LIVE)).json()) as Record<string, unknown>;
+    const third = (await (await refresh(LIVE)).json()) as Record<string, unknown>;
+
+    expect(first.access_token).toBe(LIVE);
+    expect(second.access_token).toBe(LIVE);
+    expect(third.access_token).toBe(LIVE);
+  });
+
+  test("a token rotated away BEFORE this change still resolves, inside its grace", async () => {
+    // Recovery for rows already carrying a previous_mcp_token when this shipped.
+    const future = new Date(Date.now() + 60_000).toISOString();
+    mcpTokens.set("current", {
+      mcp_token: "current",
+      previous_mcp_token: "superseded",
+      previous_token_expires_at: future,
+      expires_at: future,
+    });
+
+    const res = await refresh("superseded");
+    expect(res.status).toBe(200);
+
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.access_token).toBe("current");
+  });
+
+  test("an unknown refresh token is a terminal invalid_grant", async () => {
+    const res = await refresh("never-issued");
+
+    expect(res.status).toBe(400);
+    expect((await res.json()) as Record<string, unknown>).toMatchObject({
+      error: "invalid_grant",
+    });
+  });
+
+  test("an expired row is not resurrected by a refresh", async () => {
+    seedLiveToken({ expires_at: new Date(Date.now() - 1000).toISOString() });
+
+    const res = await refresh(LIVE);
+
+    expect(res.status).toBe(400);
+    expect((await res.json()) as Record<string, unknown>).toMatchObject({
+      error: "invalid_grant",
+    });
+  });
+
+  test("a missing refresh_token parameter is invalid_request, not invalid_grant", async () => {
+    const res = await oauth.request("/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "refresh_token" }).toString(),
+    });
+
+    expect(res.status).toBe(400);
+    expect((await res.json()) as Record<string, unknown>).toMatchObject({
+      error: "invalid_request",
+    });
   });
 });
