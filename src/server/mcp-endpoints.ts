@@ -195,7 +195,7 @@ function getOrRehydrateSession(
   mcpToken: string
 ): Promise<Session> {
   const inFlight = rehydrating.get(sessionId);
-  if (inFlight && inFlight.mcpToken === mcpToken) return inFlight.promise;
+  if (inFlight?.mcpToken === mcpToken) return inFlight.promise;
 
   const entry: Rehydration = {
     mcpToken,
@@ -255,7 +255,7 @@ async function resolveSession(
   mcpToken: string
 ): Promise<Session | "not_found" | "not_owner"> {
   const cached = sessions.get(sessionId);
-  if (cached && cached.mcpToken === mcpToken) return cached;
+  if (cached?.mcpToken === mcpToken) return cached;
 
   // `sessionStore.get()` collapses a query error into null, so a Supabase fault
   // renders as "not_found" and the client is told to re-initialize. Failing
@@ -281,7 +281,7 @@ async function resolveSession(
   // server never initiates messages; it stops being harmless the moment either
   // changes.
   const current = sessions.get(sessionId);
-  if (current && current.mcpToken === stored.mcpToken) return current;
+  if (current?.mcpToken === stored.mcpToken) return current;
 
   // Verified BEFORE anything is torn down. The tidier-looking "drop the stale
   // entry, then re-resolve" ordering would let any holder of a valid token who
