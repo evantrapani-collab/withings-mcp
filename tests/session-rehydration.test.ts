@@ -20,6 +20,10 @@
  * These tests drive the SDK directly (transport + `McpServer` + web-standard
  * `Request` objects) rather than going through Hono, so they fail on an SDK
  * regression and nothing else.
+ *
+ * `rehydrateSession()` is now the bearer-token rotation rebuild path too (see
+ * tests/session-ownership.test.ts), so a regression here breaks two mechanisms
+ * rather than one.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -342,6 +346,32 @@ describe("MCP session rehydration", () => {
       await transport.close();
 
       expect(closed).toBe(true);
+    });
+
+    test("close() does NOT fire onsessionclosed", async () => {
+      // IF THIS FAILS AFTER AN SDK BUMP: two mechanisms break at once, not one.
+      // Both the idle sweep and the rotation rebuild call `close()` on a
+      // transport they intend to discard while deliberately KEEPING its
+      // `mcp_sessions` row — the sweep so a returning client can rehydrate, the
+      // rebuild because it is about to read that row back. `onsessionclosed` is
+      // the callback that deletes it, and today it is reached only from
+      // `handleDeleteRequest()`. If a future SDK couples the two callbacks,
+      // closing a superseded transport would delete the row the rebuild depends
+      // on, turning a recoverable token rotation into a hard session loss.
+      let sessionClosedCalls = 0;
+      let onCloseCalls = 0;
+
+      const transport = await rehydrateTransport(PRE_EXISTING_SESSION_ID, () => {
+        sessionClosedCalls++;
+      });
+      transport.onclose = () => {
+        onCloseCalls++;
+      };
+
+      await transport.close();
+
+      expect(onCloseCalls).toBe(1);
+      expect(sessionClosedCalls).toBe(0);
     });
   });
 

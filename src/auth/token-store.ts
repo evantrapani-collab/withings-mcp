@@ -180,9 +180,51 @@ class TokenStore {
     return null;
   }
 
-  // Rotate the MCP token (for OAuth refresh_token grant). Keeps all stored
-  // Withings credentials and user mapping intact, just swaps the public-facing
-  // token value and extends the TTL.
+  // Renew a token's 30-day TTL without changing its value. This is what the
+  // refresh_token grant does.
+  //
+  // Returns false when no LIVE row carried the token, so the caller answers
+  // invalid_grant rather than reporting success for a token it did not extend.
+  async extendToken(mcpToken: string): Promise<boolean> {
+    const supabase = getSupabaseClient();
+    const now = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from("mcp_tokens")
+      .update({
+        expires_at: new Date(Date.now() + TTL_MS).toISOString(),
+        updated_at: now,
+      })
+      .eq("mcp_token", mcpToken)
+      // Never resurrect an already-expired row: an extension must renew a live
+      // grant, not reinstate a dead one.
+      .gt("expires_at", now)
+      .select("mcp_token");
+
+    if (error) {
+      throw new Error(`Failed to extend token: ${error.message}`);
+    }
+
+    return Array.isArray(data) && data.length > 0;
+  }
+
+  // Rotate the MCP token. Keeps all stored Withings credentials and user
+  // mapping intact, just swaps the public-facing token value and extends the
+  // TTL.
+  //
+  // DELIBERATELY NOT WIRED to the refresh_token grant, which calls
+  // extendToken() instead. This project issues ONE opaque value as both
+  // access_token and refresh_token (see /token in oauth.ts), so rotating it
+  // invalidates the bearer every concurrent holder is still using. Whichever of
+  // them missed the 60s single-slot grace was left with neither a usable bearer
+  // nor a usable refresh token and no way back, and looped
+  // 401 -> refresh -> invalid_grant until the rate limiter stopped it
+  // (production, 2026-09-09: 78 failed refreshes in 16s, then 10x 429).
+  // Rotation also detected nothing while the two values are identical: the
+  // refresh token is sent as the bearer on every /mcp request, so anyone
+  // holding one already holds the other. Retained because it is correct and
+  // becomes useful the moment access and refresh tokens are issued as distinct
+  // values — which is the precondition for wiring it back.
   //
   // Returns false if no row still carried `oldToken` — i.e. a concurrent
   // request won the rotation race. The caller must not hand `newToken` to the
@@ -221,8 +263,10 @@ class TokenStore {
     // Deliberately non-fatal: mcp_tokens has already been committed above, so
     // throwing here would 500 the /token response while the client still holds
     // a token that no longer exists — locking the user out until they redo the
-    // whole Withings OAuth flow. A stale session binding is far cheaper: it
-    // costs one 403 and a client reconnect.
+    // whole Withings OAuth flow. A stale session binding is far cheaper: the
+    // next /mcp request finds a row that still names the old token, correctly
+    // declines to self-heal, and answers 404 — one client reconnect, not the
+    // 30-minute wedge a 403 used to cause.
     try {
       await sessionStore.rotateToken(oldToken, newToken);
     } catch (err) {

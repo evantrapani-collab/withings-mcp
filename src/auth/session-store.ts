@@ -103,9 +103,17 @@ class SessionStore {
     }
   }
 
-  // Follow an MCP token rotation (OAuth refresh_token grant) so sessions
-  // established under the old bearer stay owned by the same client instead of
-  // being rejected as belonging to someone else.
+  // Follow an MCP token rotation so sessions established under the old bearer
+  // stay owned by the same client instead of being rejected as belonging to
+  // someone else.
+  //
+  // Reached only from tokenStore.rotateToken(), which the refresh_token grant
+  // no longer calls — refreshing extends the TTL and keeps the same value (see
+  // extendToken in token-store.ts). Retained alongside it: rotation needs this
+  // cascade to exist the moment access and refresh tokens are issued as
+  // distinct values. Sessions whose stored owner still names a token rotated
+  // away before that change are healed by resolveSession() in
+  // src/server/mcp-endpoints.ts.
   async rotateToken(oldToken: string, newToken: string): Promise<void> {
     const supabase = getSupabaseClient();
 

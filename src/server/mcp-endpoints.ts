@@ -34,13 +34,77 @@ const sessions = new Map<string, Session>();
 // In-flight rehydrations, so concurrent requests for the same cold session
 // (clients typically reconnect their GET stream and POST at the same moment)
 // share one transport instead of racing and orphaning the loser.
-const rehydrating = new Map<string, Promise<Session>>();
+//
+// Keyed by session id AND owner. A rehydration started for a bearer that has
+// since been rotated away builds an McpServer whose tools closed over the dead
+// token value, so joining it across a rotation would hand back a session that
+// authenticates at this layer and then fails every Withings call.
+interface Rehydration {
+  mcpToken: string;
+  promise: Promise<Session>;
+}
+
+const rehydrating = new Map<string, Rehydration>();
+
+// How long a superseded transport goes on serving the requests already in
+// flight on it before it is closed. See discardSession().
+const SUPERSEDED_DRAIN_MS = 60 * 1000;
+
+/**
+ * Drop a session's in-memory entry — but only if it is still the entry we mean.
+ *
+ * A transport's `onclose` calls back into this Map, and a superseded transport
+ * is closed on a drain timer (discardSession()) long after its replacement has
+ * been registered under the same session id. A bare `sessions.delete(id)` from
+ * a transport on its way out would evict that replacement.
+ */
+function forgetSession(sessionId: string, session: Session): void {
+  if (sessions.get(sessionId) === session) sessions.delete(sessionId);
+}
+
+/**
+ * Tear down a session whose in-memory token binding has been superseded, so it
+ * can be rebuilt under the live bearer.
+ *
+ * Reassigning `Session.mcpToken` in place would NOT work. `createServer()`
+ * hands the token to `registerAllTools()` by value, and every tool handler
+ * passes that exact string to `tokenStore.getTokens()`, which filters on the
+ * live `mcp_token` column only — a column `rotateToken()` has already moved.
+ * A re-labelled session would sail past the ownership gate and then throw
+ * "Invalid or expired token" on all 13 tools (src/withings/api.ts). That trades
+ * a diagnosable rejection for a connected-but-dead session, which is worse.
+ *
+ * The stored row is deliberately left alone: `close()` fires `transport.onclose`
+ * but not `onsessionclosed` (which only fires on an explicit DELETE), so the
+ * binding the rebuild is about to read survives.
+ *
+ * Unbound immediately so the rebuild can take the slot, but closed only after a
+ * drain. The SDK's `close()` runs `cleanup()` over every open stream and then
+ * `onclose`, all synchronously — closing here and now would abort requests that
+ * were authenticated while the superseded bearer was still live and have not
+ * yet written a response, which on an SSE stream means a 200 with an empty body
+ * and a client that waits forever. The timer is also what eventually reclaims
+ * the transport: the idle sweep walks `sessions`, and this one is no longer in
+ * it.
+ */
+function discardSession(sessionId: string, session: Session): void {
+  forgetSession(sessionId, session);
+
+  const drain = setTimeout(() => {
+    session.transport.close().catch((err) => {
+      logger.warn("Error closing superseded transport", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }, SUPERSEDED_DRAIN_MS);
+  drain.unref?.();
+}
 
 const sweep = setInterval(() => {
   const cutoff = Date.now() - IDLE_TIMEOUT_MS;
   for (const [id, session] of sessions) {
     if (session.lastActivityAt < cutoff) {
-      sessions.delete(id);
+      forgetSession(id, session);
       session.transport.close().catch((err) => {
         logger.warn("Error closing idle transport", {
           error: err instanceof Error ? err.message : String(err),
@@ -77,18 +141,25 @@ function createServer(mcpToken: string): McpServer {
  * and re-read every Withings credential from Supabase per call. The negotiated
  * client capabilities are lost, which is harmless here — all tools are
  * read-only and the server never initiates sampling, elicitation or roots.
+ *
+ * This is also the rotation-rebuild path: a session whose bearer was rotated is
+ * discarded and rebuilt here under the new token value.
  */
 async function rehydrateSession(
   sessionId: string,
   mcpToken: string
 ): Promise<Session> {
+  // Declared up front so the teardown callbacks can identity-guard their Map
+  // delete against the entry they actually belong to.
+  let session: Session | undefined;
+
   const transport = new WebStandardStreamableHTTPServerTransport({
     // Close over the id rather than taking the callback argument: this SDK
     // passes `this.sessionId` (which we assign below, so it is correct today),
     // but a stateless transport has no session of its own and a future version
     // could reasonably pass `undefined` here.
     onsessionclosed: () => {
-      sessions.delete(sessionId);
+      if (session) forgetSession(sessionId, session);
       void sessionStore.delete(sessionId).catch((err) => {
         logger.warn("Failed to delete MCP session", {
           error: err instanceof Error ? err.message : String(err),
@@ -100,18 +171,20 @@ async function rehydrateSession(
   transport.sessionId = sessionId;
 
   transport.onclose = () => {
-    sessions.delete(sessionId);
+    if (session) forgetSession(sessionId, session);
   };
 
   await createServer(mcpToken).connect(transport);
 
-  const session: Session = {
+  session = {
     transport,
     mcpToken,
     lastActivityAt: Date.now(),
     lastPersistedAt: Date.now(),
   };
+
   sessions.set(sessionId, session);
+
   logger.info("MCP session rehydrated from store");
 
   return session;
@@ -122,14 +195,19 @@ function getOrRehydrateSession(
   mcpToken: string
 ): Promise<Session> {
   const inFlight = rehydrating.get(sessionId);
-  if (inFlight) return inFlight;
+  if (inFlight && inFlight.mcpToken === mcpToken) return inFlight.promise;
 
-  const pending = rehydrateSession(sessionId, mcpToken).finally(() => {
-    rehydrating.delete(sessionId);
-  });
-  rehydrating.set(sessionId, pending);
+  const entry: Rehydration = {
+    mcpToken,
+    promise: rehydrateSession(sessionId, mcpToken).finally(() => {
+      // Identity-guarded: a rehydration superseded by a rotation must not clear
+      // the slot its replacement now holds.
+      if (rehydrating.get(sessionId) === entry) rehydrating.delete(sessionId);
+    }),
+  };
+  rehydrating.set(sessionId, entry);
 
-  return pending;
+  return entry.promise;
 }
 
 /**
@@ -148,20 +226,75 @@ function isInitializeMessage(body: unknown): boolean {
 }
 
 /**
- * Resolve a session id this process has no memory of. Returning 404 is what the
- * spec prescribes, but no shipping client implements the "404 -> re-initialize"
- * contract (the SDK client never clears its session id), so a cold cache would
- * wedge the client until the whole app is restarted.
+ * Resolve the session this request names, to the extent the presented bearer is
+ * entitled to it. `mcp_sessions` is the authority; the in-memory Map is a cache
+ * of it, trusted only while it agrees with the presented bearer.
+ *
+ * The Map's binding is captured once at handshake and never updated, but the
+ * bearer changes underneath it. The OAuth refresh_token grant rotates the token
+ * value and `tokenStore.rotateToken()` cascades that into `mcp_sessions` — a
+ * correction a live Map entry short-circuited past and never read, so the very
+ * request the cascade was written for still failed (production, 2026-09-09:
+ * four "token does not match session owner" warnings on the connector's
+ * tool-call path, self-clearing only after the 30-minute idle sweep). Consulting
+ * the row on a mismatch also makes a rotation served by one replica heal on
+ * every other replica's next request.
+ *
+ * The store can only ever confirm that the PRESENTED bearer owns the session,
+ * never that some other bearer does: a row naming a different token is refused,
+ * not adopted, and refusal mutates nothing at all.
+ *
+ * It must never fall back to `previous_mcp_token`. That grace window belongs to
+ * the /token refresh grant alone (`resolveRefreshToken`); honouring it here
+ * would make a rotated-away bearer usable for real data access for 60 seconds.
+ * `authenticateBearer` already rejects a superseded token with 401, so one
+ * cannot reach this function today — keep it that way.
  */
-async function resolveStoredSession(
+async function resolveSession(
   sessionId: string,
   mcpToken: string
-): Promise<Session | "not_found" | "forbidden"> {
+): Promise<Session | "not_found" | "not_owner"> {
+  const cached = sessions.get(sessionId);
+  if (cached && cached.mcpToken === mcpToken) return cached;
+
+  // `sessionStore.get()` collapses a query error into null, so a Supabase fault
+  // renders as "not_found" and the client is told to re-initialize. Failing
+  // closed is deliberate for an authorization decision: there must be no
+  // "store unreachable, trust the Map" branch.
   const stored = await sessionStore.get(sessionId);
   if (!stored) return "not_found";
-  if (stored.mcpToken !== mcpToken) return "forbidden";
+  if (stored.mcpToken !== mcpToken) return "not_owner";
 
-  return getOrRehydrateSession(sessionId, mcpToken);
+  // Re-read the Map. `cached` is a snapshot from BEFORE the store round-trip,
+  // and a concurrent request for the same session id — the "client reconnects
+  // its GET stream and POSTs at the same moment" pattern this file already
+  // expects — may have rebuilt it while this one was waiting on Supabase.
+  // Acting on the stale snapshot builds a second transport for one session id
+  // and orphans the first. `rehydrating` alone cannot cover this: it is
+  // consulted only after the await, whereas the decision to rebuild was made
+  // before it.
+  //
+  // Not covered by a test, deliberately: the loser is no longer torn down, so a
+  // duplicate rebuild has no HTTP-observable symptom to assert — it costs a
+  // wasted McpServer and leaves a standalone GET stream attached to a transport
+  // nothing routes to any more. Harmless while every tool is read-only and the
+  // server never initiates messages; it stops being harmless the moment either
+  // changes.
+  const current = sessions.get(sessionId);
+  if (current && current.mcpToken === stored.mcpToken) return current;
+
+  // Verified BEFORE anything is torn down. The tidier-looking "drop the stale
+  // entry, then re-resolve" ordering would let any holder of a valid token who
+  // guessed a session id kill a stranger's live transport.
+  if (current) {
+    logger.info("Rebuilding MCP session under a rotated bearer token");
+    discardSession(sessionId, current);
+  }
+
+  // `stored.mcpToken` rather than `mcpToken`: the two are provably equal by
+  // here, and reading the owner out of the row makes it plain that nothing a
+  // client presents can ever become a session's owner.
+  return getOrRehydrateSession(sessionId, stored.mcpToken);
 }
 
 // Keep the stored session alive without adding a write to every tool call.
@@ -175,9 +308,37 @@ function touchSession(session: Session, sessionId: string): void {
   void sessionStore.touch(sessionId);
 }
 
-function forbidden(c: AppContext) {
-  logger.warn("Session access denied: token does not match session owner");
-  return c.json({ error: "forbidden" }, 403);
+/**
+ * The one answer for "this session id is not usable by this bearer": 404, the
+ * status Streamable HTTP assigns to a terminated session and the only one a
+ * client has a defined recovery for — start a new session by sending a fresh
+ * InitializeRequest with no session id attached.
+ *
+ * It used to be 403 for a session owned by someone else and 404 for one that
+ * does not exist. 403 was wrong twice over. It asserts "re-authenticating will
+ * not help", which is the opposite of the truth — re-initializing is exactly
+ * what helps — and it was an existence oracle, telling a holder of any valid
+ * token which session ids are live. Production on 2026-09-09 shows the cost:
+ * two 403s at 09:22:15/09:22:19 after a re-authorization, and recovery only at
+ * 09:22:21 when the connector re-handshaked out of a generic error path. A
+ * client that wedges on 404 wedges at least as hard on 403, so this cannot be
+ * worse.
+ *
+ * The two reasons answer identically on the wire — a client can do nothing
+ * different with them — and stay apart only in the log, which is where the
+ * original diagnosis came from.
+ */
+function invalidSession(c: AppContext, reason: "not_found" | "not_owner") {
+  if (reason === "not_owner") {
+    // Unchanged wording on purpose: this is the string the incident was found
+    // with, and it is now the only machine-readable signal for a genuine
+    // cross-client attempt. An unknown id logs nothing — a warn there would be
+    // a log-flood amplifier for anyone spraying session ids, and the access log
+    // already records the request.
+    logger.warn("Session access denied: token does not match session owner");
+  }
+
+  return c.json({ error: "invalid_session" }, 404);
 }
 
 /**
@@ -191,24 +352,24 @@ export const handleMcp = async (c: AppContext) => {
   const sessionId = c.req.header("mcp-session-id");
   const parsedBody = c.get("parsedBody");
 
-  let session = sessionId ? sessions.get(sessionId) : undefined;
+  let session: Session | undefined;
 
-  if (sessionId && !session && !isInitializeMessage(parsedBody)) {
-    const resolved = await resolveStoredSession(sessionId, mcpToken);
+  // An initialize request always starts a fresh session, so a session id sent
+  // alongside one is ignored even when this process still holds it in memory.
+  // Ignoring it on the cold path only was enough while ownership was also
+  // checked unconditionally further down; now that the check lives inside
+  // resolveSession(), a batch of [initialize, tools/call] carrying a foreign
+  // session id would otherwise be forwarded straight into the victim's
+  // transport — isInitializeMessage() is true if ANY message in a batch is an
+  // initialize.
+  if (sessionId && !isInitializeMessage(parsedBody)) {
+    const resolved = await resolveSession(sessionId, mcpToken);
 
-    if (resolved === "not_found") {
-      return c.json({ error: "invalid_session" }, 404);
-    }
-    if (resolved === "forbidden") {
-      return forbidden(c);
+    if (resolved === "not_found" || resolved === "not_owner") {
+      return invalidSession(c, resolved);
     }
 
     session = resolved;
-  }
-
-  // Validate bearer token matches session owner
-  if (session && session.mcpToken !== mcpToken) {
-    return forbidden(c);
   }
 
   // Existing session — forward to its transport.
@@ -226,15 +387,22 @@ export const handleMcp = async (c: AppContext) => {
   }
 
   // New session — create transport + server
+  //
+  // Held so the teardown callbacks can identity-guard their Map delete: close()
+  // settles on a later tick, and by then this id may map to a session rebuilt
+  // under a rotated bearer, which must not be evicted by its predecessor.
+  let established: Session | undefined;
+
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: () => crypto.randomUUID(),
     onsessioninitialized: async (id) => {
-      sessions.set(id, {
+      established = {
         transport,
         mcpToken,
         lastActivityAt: Date.now(),
         lastPersistedAt: Date.now(),
-      });
+      };
+      sessions.set(id, established);
       // Persist so the session outlives this process. A failure here only
       // costs restart-survivability, so degrade instead of failing the
       // handshake.
@@ -248,7 +416,7 @@ export const handleMcp = async (c: AppContext) => {
       logger.info("MCP session established");
     },
     onsessionclosed: (id) => {
-      sessions.delete(id);
+      if (established) forgetSession(id, established);
       void sessionStore.delete(id).catch((err) => {
         logger.warn("Failed to delete MCP session", {
           error: err instanceof Error ? err.message : String(err),
@@ -260,10 +428,13 @@ export const handleMcp = async (c: AppContext) => {
 
   // Belt-and-suspenders: onsessionclosed only fires on explicit DELETE.
   // onclose fires whenever the transport itself is torn down (idle sweep,
-  // server shutdown, internal SDK errors), so wire both. This one drops the
-  // in-memory entry only — the stored session must survive a restart.
+  // server shutdown, a rotation rebuild superseding it, internal SDK errors),
+  // so wire both. This one drops the in-memory entry only — the stored session
+  // must survive a restart, and a rebuild depends on that row still being there.
   transport.onclose = () => {
-    if (transport.sessionId) sessions.delete(transport.sessionId);
+    if (transport.sessionId && established) {
+      forgetSession(transport.sessionId, established);
+    }
   };
 
   await createServer(mcpToken).connect(transport);
