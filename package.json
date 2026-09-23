@@ -31,14 +31,14 @@
   "homepage": "https://github.com/akutishevsky/withings-mcp#readme",
   "dependencies": {
     "@cfworker/json-schema": "^4.1.1",
-    "@modelcontextprotocol/hono": "^2.0.0-alpha.2",
-    "@modelcontextprotocol/server": "^2.0.0-alpha.2",
-    "@supabase/supabase-js": "^2.45.0",
-    "hono": "^4.12.31",
-    "zod": "^4.0.0"
+    "@modelcontextprotocol/hono": "^2.0.1",
+    "@modelcontextprotocol/server": "^2.1.0",
+    "@supabase/supabase-js": "^2.117.1",
+    "hono": "^4.13.8",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@types/bun": "latest",
+    "@types/bun": "^1.4.2",
     "typescript": "^5.7.2"
   }
 }
